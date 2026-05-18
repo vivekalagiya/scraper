@@ -355,8 +355,8 @@ def sync_csv_to_db(csv_path):
         traceback.print_exc()
 
 
-def get_pending_products_from_db():
-    """Fetch all enabled products with 'pending' scraping_status, ordered by sales."""
+def get_pending_count_from_db():
+    """Get the lightweight count of enabled products with 'pending' scraping_status."""
     try:
         pg_host = os.environ.get("PG_HOST")
         pg_port = os.environ.get("PG_PORT", "5432")
@@ -365,17 +365,38 @@ def get_pending_products_from_db():
         pg_db = os.environ.get("PG_DB")
 
         conn = psycopg2.connect(host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db)
-        # Fetch status=1 (enabled) and order by 30daymfrsales descending
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM products_to_scrape WHERE scraping_status = 'pending' AND status = 1")
+        count = cursor.fetchone()[0]
+        cursor.close()
+        conn.close()
+        return count
+    except Exception as e:
+        print(f"Error getting pending count from DB: {e}")
+        return 0
+
+def get_pending_chunk_from_db(limit, offset):
+    """Fetch only a specific partitioned slice of pending products using SQL LIMIT and OFFSET."""
+    try:
+        pg_host = os.environ.get("PG_HOST")
+        pg_port = os.environ.get("PG_PORT", "5432")
+        pg_user = os.environ.get("PG_USER")
+        pg_pass = os.environ.get("PG_PASS")
+        pg_db = os.environ.get("PG_DB")
+
+        conn = psycopg2.connect(host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db)
+        # Fetch only the assigned chunk's slice, ordered by sales descending
         query = """
             SELECT * FROM products_to_scrape 
             WHERE scraping_status = 'pending' AND status = 1
             ORDER BY "30daymfrsales" DESC NULLS LAST, product_id ASC
+            LIMIT %s OFFSET %s
         """
-        df = pd.read_sql(query, conn)
+        df = pd.read_sql(query, conn, params=(int(limit), int(offset)))
         conn.close()
         return df
     except Exception as e:
-        print(f"Error fetching pending products: {e}")
+        print(f"Error fetching pending chunk from DB: {e}")
         return pd.DataFrame()
 
 def update_product_status(product_id, scraping_status, error_message=None):
@@ -902,44 +923,54 @@ def get_chrome_major_version():
 
 def setup_driver(max_attempts=3, base_delay=4):
     last_err = None
+    
+    def build_chrome_options():
+        options = uc.ChromeOptions()
+        chrome_bin = os.environ.get("CHROME_BIN")
+        if chrome_bin:
+            options.binary_location = chrome_bin
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-logging")
+        options.add_argument("--log-level=3")
+        options.add_argument("--window-size=1366,768")
+        options.add_argument("--lang=en-US")
+        options.add_argument("--disable-notifications")
+        return options
+
     for attempt in range(1, max_attempts + 1):
         driver = None
         try:
             time.sleep(2)
-            options = uc.ChromeOptions()
+            options = build_chrome_options()
             chrome_bin = os.environ.get("CHROME_BIN")
-            if chrome_bin:
-                options.binary_location = chrome_bin
-
-            # Comment out for local testing to see browser
-            # options.add_argument("--headless=new")
-
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--disable-logging")
-            options.add_argument("--log-level=3")
-            options.add_argument("--window-size=1366,768")
-            options.add_argument("--lang=en-US")
-            options.add_argument("--disable-notifications")
-
+            chromedriver_bin = os.environ.get("CHROMEDRIVER_BIN")
+            
             major_ver = get_chrome_major_version()
+            
+            uc_kwargs = {
+                "options": options
+            }
+            
             if major_ver:
-                driver = uc.Chrome(options=options, version_main=major_ver)
-            else:
-                try:
-                    driver = uc.Chrome(options=options)
-                except Exception as auto_err:
-                    print(f"Auto-detection of chrome version failed, falling back to 146: {auto_err}")
-                    driver = uc.Chrome(options=options, version_main=146)
+                uc_kwargs["version_main"] = major_ver
+            
+            if chromedriver_bin and os.path.exists(chromedriver_bin):
+                uc_kwargs["driver_executable_path"] = chromedriver_bin
+                print(f"✓ Using pre-configured ChromeDriver binary: {chromedriver_bin}")
+                
+            if chrome_bin and os.path.exists(chrome_bin):
+                uc_kwargs["browser_executable_path"] = chrome_bin
+                print(f"✓ Using pre-configured Chrome binary: {chrome_bin}")
 
+            driver = uc.Chrome(**uc_kwargs)
             normalize_driver_fingerprint(driver)
             warm_google_session(driver)
             return driver
 
         except Exception as e:
             last_err = e
-            msg = str(e)
-            print(f"Driver start failed (attempt {attempt}/{max_attempts}): {msg}")
+            print(f"Driver start failed (attempt {attempt}/{max_attempts}): {str(e)}")
             try:
                 if driver:
                     driver.quit()
@@ -947,6 +978,7 @@ def setup_driver(max_attempts=3, base_delay=4):
                 pass
             if attempt < max_attempts:
                 time.sleep(base_delay * attempt + random.uniform(0, 2))
+                
     if last_err:
         raise last_err
     raise RuntimeError("Driver start failed with unknown error")
@@ -2195,23 +2227,34 @@ def main():
     if args.chunk_id == 1:
         reset_error_products_to_pending()
     
-    # Fetch pending products from DB
-    full_pending_df = get_pending_products_from_db()
-    if full_pending_df.empty:
+    # Fetch total pending products count first (extremely fast)
+    total_pending = get_pending_count_from_db()
+    if total_pending == 0:
         print("No pending products found in DB. All done!")
         sys.exit(0)
 
-    print(f"Total pending products in DB: {len(full_pending_df)}")
+    print(f"Total pending products in DB: {total_pending}")
 
-    # Calculate this chunk's slice
-    total_rows = len(full_pending_df)
-    chunk_count = max(1, min(int(args.total_chunks), total_rows))
-    rows_per_chunk = total_rows // chunk_count
+    # Calculate balanced limit and offset for this chunk
+    chunk_id = int(args.chunk_id)
+    total_chunks = int(args.total_chunks)
     
-    start_idx = (args.chunk_id - 1) * rows_per_chunk
-    end_idx = args.chunk_id * rows_per_chunk if args.chunk_id < chunk_count else total_rows
+    # Bound chunk_id and total_chunks to actual total_pending size
+    total_chunks = max(1, min(total_chunks, total_pending))
+    if chunk_id > total_chunks:
+        print(f"Chunk {chunk_id} is out of bounds (total chunks adjusted to {total_chunks}).")
+        sys.exit(0)
+        
+    base_rows = total_pending // total_chunks
+    remainder = total_pending % total_chunks
     
-    chunk_df = full_pending_df.iloc[start_idx:end_idx]
+    limit = base_rows + (1 if chunk_id <= remainder else 0)
+    offset = (chunk_id - 1) * base_rows + min(chunk_id - 1, remainder)
+    
+    print(f"Chunk {chunk_id} of {total_chunks}: Limit={limit}, Offset={offset}")
+    
+    # Query database using SQL LIMIT and OFFSET
+    chunk_df = get_pending_chunk_from_db(limit, offset)
     
     if chunk_df.empty:
         print(f"Chunk {args.chunk_id} has no products to process.")
