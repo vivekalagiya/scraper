@@ -376,7 +376,7 @@ def get_pending_count_from_db():
         return 0
 
 def get_pending_chunk_from_db(limit, offset):
-    """Fetch only a specific partitioned slice of pending products using SQL LIMIT and OFFSET."""
+    """Fetch and atomically claim a specific partitioned slice of pending products using FOR UPDATE SKIP LOCKED."""
     try:
         pg_host = os.environ.get("PG_HOST")
         pg_port = os.environ.get("PG_PORT", "5432")
@@ -384,19 +384,55 @@ def get_pending_chunk_from_db(limit, offset):
         pg_pass = os.environ.get("PG_PASS")
         pg_db = os.environ.get("PG_DB")
 
-        conn = psycopg2.connect(host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db)
-        # Fetch only the assigned chunk's slice, ordered by sales descending
-        query = """
-            SELECT * FROM products_to_scrape 
-            WHERE scraping_status = 'pending' AND status = 1
-            ORDER BY "30daymfrsales" DESC NULLS LAST, product_id ASC
-            LIMIT %s OFFSET %s
+        conn = psycopg2.connect(
+            host=pg_host, 
+            port=pg_port, 
+            user=pg_user, 
+            password=pg_pass, 
+            dbname=pg_db,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5
+        )
+        cursor = conn.cursor()
+        
+        # We perform an atomic checkout: SELECT ... FOR UPDATE SKIP LOCKED
+        # and UPDATE their status to 'scraping' in a single transaction.
+        # Note: We ignore the offset parameter entirely to ensure dynamic, collision-free locking!
+        checkout_query = """
+            WITH claimed AS (
+                SELECT product_id FROM products_to_scrape
+                WHERE scraping_status = 'pending' AND status = 1
+                ORDER BY "30daymfrsales" DESC NULLS LAST, product_id ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE products_to_scrape
+            SET scraping_status = 'scraping',
+                last_attempt = CURRENT_TIMESTAMP
+            FROM claimed
+            WHERE products_to_scrape.product_id = claimed.product_id
+            RETURNING products_to_scrape.*;
         """
-        df = pd.read_sql(query, conn, params=(int(limit), int(offset)))
+        
+        cursor.execute(checkout_query, (int(limit),))
+        
+        # Fetch the results into a pandas DataFrame
+        colnames = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        df = pd.DataFrame(rows, columns=colnames)
+        
+        conn.commit()
+        cursor.close()
         conn.close()
+        
+        if not df.empty:
+            print(f"✓ Atomically claimed {len(df)} pending products with status='scraping'.")
         return df
     except Exception as e:
-        print(f"Error fetching pending chunk from DB: {e}")
+        print(f"Error claiming and fetching pending chunk from DB: {e}")
+        traceback.print_exc()
         return pd.DataFrame()
 
 def update_product_status(product_id, scraping_status, error_message=None):
@@ -421,7 +457,7 @@ def update_product_status(product_id, scraping_status, error_message=None):
         print(f"Error updating status for {product_id}: {e}")
 
 def reset_error_products_to_pending():
-    """Reset all products with 'error' scraping_status to 'pending' to retry them."""
+    """Reset failed products ('error') and stalled products ('scraping' older than 3 hours) to 'pending'."""
     try:
         pg_host = os.environ.get("PG_HOST")
         pg_port = os.environ.get("PG_PORT", "5432")
@@ -431,15 +467,20 @@ def reset_error_products_to_pending():
 
         conn = psycopg2.connect(host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db)
         cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE products_to_scrape SET scraping_status = 'pending' WHERE scraping_status = 'error'"
-        )
+        # Reset products in 'error' state OR products that have been in 'scraping' state for more than 3 hours
+        query = """
+            UPDATE products_to_scrape 
+            SET scraping_status = 'pending' 
+            WHERE scraping_status = 'error' 
+               OR (scraping_status = 'scraping' AND last_attempt < CURRENT_TIMESTAMP - INTERVAL '3 hours')
+        """
+        cursor.execute(query)
         conn.commit()
         affected_rows = cursor.rowcount
         cursor.close()
         conn.close()
         if affected_rows > 0:
-            print(f"✓ Reset {affected_rows} failed products from 'error' to 'pending' for retry.")
+            print(f"✓ Reset {affected_rows} failed or stalled products to 'pending' for retry.")
         return affected_rows
     except Exception as e:
         print(f"Error resetting error products to pending: {e}")
@@ -456,8 +497,8 @@ def generate_reconciliation_report(output_path):
 
         conn = psycopg2.connect(host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db)
         
-        # Fetch only products that have been scraped (non-pending status)
-        products_df = pd.read_sql("SELECT * FROM products_to_scrape WHERE scraping_status != 'pending'", conn)
+        # Fetch only products that have been scraped (non-pending, non-scraping status)
+        products_df = pd.read_sql("SELECT * FROM products_to_scrape WHERE scraping_status NOT IN ('pending', 'scraping')", conn)
         results_df = pd.read_sql("SELECT * FROM product_scraping_results", conn)
         sellers_df = pd.read_sql("SELECT * FROM product_sellers", conn)
         conn.close()
