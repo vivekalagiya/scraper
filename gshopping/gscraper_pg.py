@@ -28,6 +28,9 @@ import psycopg2
 from psycopg2.extras import execute_values
 import ftplib
 
+CLAIM_STATUS = "claimed"
+PENDING_STATUS = "pending"
+
 def upload_to_ftp(ftp_host, ftp_user, ftp_pass, ftp_path, local_file, remote_filename):
     """Upload a file to the FTP server securely."""
     try:
@@ -209,13 +212,38 @@ def insert_to_postgres(product_results, seller_results):
 
         # 3. Transactionally update scraping_status in products_to_scrape table
         if product_results:
-            status_update_query = """
-                UPDATE products_to_scrape 
-                SET scraping_status = %s, 
-                    last_attempt = CURRENT_TIMESTAMP, 
-                    error_message = %s 
+            status_update_query_fallback = """
+                UPDATE products_to_scrape
+                SET scraping_status = %s,
+                    last_attempt = CURRENT_TIMESTAMP,
+                    error_message = %s
                 WHERE product_id = %s
             """
+            status_update_query_with_claim_clear = """
+                UPDATE products_to_scrape
+                SET scraping_status = %s,
+                    last_attempt = CURRENT_TIMESTAMP,
+                    error_message = %s,
+                    claimed_by = NULL,
+                    claimed_at = NULL
+                WHERE product_id = %s
+            """
+            supports_claims = False
+            try:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_name = 'products_to_scrape'
+                      AND column_name IN ('claimed_by', 'claimed_at')
+                    GROUP BY table_name
+                    HAVING COUNT(*) = 2
+                    """
+                )
+                supports_claims = cursor.fetchone() is not None
+            except Exception:
+                supports_claims = False
+
             for r in product_results:
                 p_id = str(r.get("product_id", "")).strip()
                 status_lower = str(r.get("status", "")).strip().lower()
@@ -231,7 +259,10 @@ def insert_to_postgres(product_results, seller_results):
                     scr_status = 'error'
                     err_msg = r.get('last_response', 'Scrape failed to return data')
                 
-                cursor.execute(status_update_query, (scr_status, err_msg, p_id))
+                cursor.execute(
+                    status_update_query_with_claim_clear if supports_claims else status_update_query_fallback,
+                    (scr_status, err_msg, p_id),
+                )
 
         conn.commit()
         cursor.close()
@@ -375,6 +406,114 @@ def get_pending_count_from_db():
         print(f"Error getting pending count from DB: {e}")
         return 0
 
+def _get_pg_conn():
+    pg_host = os.environ.get("PG_HOST")
+    pg_port = os.environ.get("PG_PORT", "5432")
+    pg_user = os.environ.get("PG_USER")
+    pg_pass = os.environ.get("PG_PASS")
+    pg_db = os.environ.get("PG_DB")
+    return psycopg2.connect(host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db)
+
+def _get_worker_id(explicit_worker_id=None):
+    if explicit_worker_id:
+        return str(explicit_worker_id)
+    for key in ("SCRAPER_WORKER_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_RUN_ID", "GITHUB_JOB", "HOSTNAME"):
+        val = os.environ.get(key)
+        if val:
+            return f"{key}:{val}"
+    return f"pid:{os.getpid()}"
+
+def release_expired_claims(ttl_minutes=60):
+    """Release old claims so another runner can pick them up."""
+    try:
+        conn = _get_pg_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE products_to_scrape
+            SET scraping_status = %s,
+                claimed_by = NULL,
+                claimed_at = NULL
+            WHERE scraping_status = %s
+              AND claimed_at IS NOT NULL
+              AND claimed_at < (NOW() - (%s || ' minutes')::interval)
+            """,
+            (PENDING_STATUS, CLAIM_STATUS, int(ttl_minutes)),
+        )
+        released = cursor.rowcount
+        conn.commit()
+        cursor.close()
+        conn.close()
+        if released:
+            print(f"✓ Released {released} expired claimed products (TTL={ttl_minutes}m).")
+        return released
+    except Exception as e:
+        print(f"Error releasing expired claims: {e}")
+        return 0
+
+def claim_pending_products_from_db(limit=30, worker_id=None, ttl_minutes=60):
+    """
+    Atomically claim up to `limit` pending products using row locks (FOR UPDATE SKIP LOCKED).
+    Requires columns: claimed_by, claimed_at; and supports scraping_status='claimed'.
+    """
+    try:
+        worker_id = _get_worker_id(worker_id)
+        conn = _get_pg_conn()
+        conn.autocommit = False
+        cursor = conn.cursor()
+        # Release expired claims first (best-effort)
+        try:
+            cursor.execute(
+                """
+                UPDATE products_to_scrape
+                SET scraping_status = %s,
+                    claimed_by = NULL,
+                    claimed_at = NULL
+                WHERE scraping_status = %s
+                  AND claimed_at IS NOT NULL
+                  AND claimed_at < (NOW() - (%s || ' minutes')::interval)
+                """,
+                (PENDING_STATUS, CLAIM_STATUS, int(ttl_minutes)),
+            )
+        except Exception:
+            conn.rollback()
+            # If schema doesn't have claim columns yet, let the caller know via empty df.
+            cursor.close()
+            conn.close()
+            return pd.DataFrame()
+
+        cursor.execute(
+            """
+            WITH picked AS (
+                SELECT product_id
+                FROM products_to_scrape
+                WHERE scraping_status = %s AND status = 1
+                ORDER BY "30daymfrsales" DESC NULLS LAST, product_id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            )
+            UPDATE products_to_scrape p
+            SET scraping_status = %s,
+                claimed_by = %s,
+                claimed_at = NOW(),
+                last_attempt = NOW(),
+                error_message = NULL
+            FROM picked
+            WHERE p.product_id = picked.product_id
+            RETURNING p.*
+            """,
+            (PENDING_STATUS, int(limit), CLAIM_STATUS, worker_id),
+        )
+        rows = cursor.fetchall()
+        cols = [d[0] for d in cursor.description] if cursor.description else []
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return pd.DataFrame(rows, columns=cols)
+    except Exception as e:
+        print(f"Error claiming pending products from DB: {e}")
+        return pd.DataFrame()
+
 def get_pending_chunk_from_db(limit, offset):
     """Fetch only a specific partitioned slice of pending products using SQL LIMIT and OFFSET."""
     try:
@@ -402,18 +541,27 @@ def get_pending_chunk_from_db(limit, offset):
 def update_product_status(product_id, scraping_status, error_message=None):
     """Update the scraping_status of a product in the products_to_scrape table."""
     try:
-        pg_host = os.environ.get("PG_HOST")
-        pg_port = os.environ.get("PG_PORT", "5432")
-        pg_user = os.environ.get("PG_USER")
-        pg_pass = os.environ.get("PG_PASS")
-        pg_db = os.environ.get("PG_DB")
-
-        conn = psycopg2.connect(host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db)
+        conn = _get_pg_conn()
         cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE products_to_scrape SET scraping_status = %s, last_attempt = CURRENT_TIMESTAMP, error_message = %s WHERE product_id = %s",
-            (scraping_status, error_message, str(product_id))
-        )
+        try:
+            cursor.execute(
+                """
+                UPDATE products_to_scrape
+                SET scraping_status = %s,
+                    last_attempt = CURRENT_TIMESTAMP,
+                    error_message = %s,
+                    claimed_by = NULL,
+                    claimed_at = NULL
+                WHERE product_id = %s
+                """,
+                (scraping_status, error_message, str(product_id)),
+            )
+        except Exception:
+            conn.rollback()
+            cursor.execute(
+                "UPDATE products_to_scrape SET scraping_status = %s, last_attempt = CURRENT_TIMESTAMP, error_message = %s WHERE product_id = %s",
+                (scraping_status, error_message, str(product_id)),
+            )
         conn.commit()
         cursor.close()
         conn.close()
@@ -2258,6 +2406,10 @@ def main():
     parser.add_argument('--max-rounds', type=int, default=10, help='Maximum recursive rounds')
     parser.add_argument('--reset-errors', action='store_true', help='Reset all error products to pending and exit')
     parser.add_argument('--export-report', type=str, required=False, default=None, help='Generate reconciliation report CSV at specified path and exit')
+    parser.add_argument('--claim-mode', action='store_true', help='Use DB claiming queue (recommended for parallel accounts)')
+    parser.add_argument('--claim-limit', type=int, default=int(os.environ.get("CLAIM_LIMIT", "30")), help='How many products to claim and scrape')
+    parser.add_argument('--claim-ttl-minutes', type=int, default=int(os.environ.get("CLAIM_TTL_MINUTES", "60")), help='Release claims older than this TTL')
+    parser.add_argument('--worker-id', type=str, default=os.environ.get("SCRAPER_WORKER_ID", None), help='Worker identifier stored in DB claims')
     
     args = parser.parse_args()
     
@@ -2287,6 +2439,16 @@ def main():
         sys.exit(0)
 
     print(f"Total pending products in DB: {total_pending}")
+
+    if args.claim_mode:
+        print(f"Claim mode enabled: worker={_get_worker_id(args.worker_id)} limit={args.claim_limit} ttl={args.claim_ttl_minutes}m")
+        chunk_df = claim_pending_products_from_db(limit=args.claim_limit, worker_id=args.worker_id, ttl_minutes=args.claim_ttl_minutes)
+        if chunk_df.empty:
+            print("No claimable pending products found (or claim columns missing).")
+            sys.exit(0)
+        chunk_result = process_chunk(chunk_df, 1, 1)
+        success = chunk_result.get("success", False)
+        sys.exit(0 if success else 1)
 
     # Calculate balanced limit and offset for this chunk
     chunk_id = int(args.chunk_id)
