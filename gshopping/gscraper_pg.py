@@ -97,6 +97,20 @@ def insert_to_postgres(product_results, seller_results):
         )
         cursor = conn.cursor()
 
+        # Identify retryable product IDs (completed but missing a valid product_url)
+        retry_product_ids = set()
+        valid_product_results = []
+        for r in product_results or []:
+            status_lower = str(r.get("status", "")).strip().lower()
+            p_url = str(r.get("product_url", "")).strip()
+            is_completed = status_lower == 'completed' or status_lower == 'product_found'
+            is_valid_url = p_url.startswith("https://www.google.com/search?ibp=oshop") or p_url.startswith("https://share.google/")
+            
+            if is_completed and not is_valid_url:
+                retry_product_ids.add(str(r.get("product_id", "")).strip())
+            else:
+                valid_product_results.append(r)
+
         # Gather all product_ids to clean up pre-existing competitor/seller records
         if product_results:
             prod_ids = [str(r.get("product_id", "")).strip() for r in product_results if r.get("product_id")]
@@ -105,7 +119,7 @@ def insert_to_postgres(product_results, seller_results):
                 cursor.execute("DELETE FROM product_sellers WHERE product_code = ANY(%s)", (prod_ids,))
 
         # 1. Upsert product_scraping_results (1-to-1 relationship)
-        if product_results:
+        if valid_product_results:
             prod_insert = """
                 INSERT INTO product_scraping_results (
                     product_id, web_id, name, mpn_sku, gtin, brand, category,
@@ -143,7 +157,7 @@ def insert_to_postgres(product_results, seller_results):
                     updated_at = CURRENT_TIMESTAMP
             """
             prod_values = []
-            for r in product_results:
+            for r in valid_product_results:
                 prod_values.append((
                     str(r.get("product_id", "")),
                     str(r.get("web_id", "")),
@@ -175,7 +189,13 @@ def insert_to_postgres(product_results, seller_results):
             execute_values(cursor, prod_insert, prod_values)
 
         # 2. Upsert product_sellers (1-to-many relationship)
-        if seller_results:
+        valid_seller_results = []
+        for r in seller_results or []:
+            p_code = str(r.get("product_id", r.get("product_code", ""))).strip()
+            if p_code not in retry_product_ids:
+                valid_seller_results.append(r)
+
+        if valid_seller_results:
             seller_insert = """
                 INSERT INTO product_sellers (
                     product_code, seller_name, seller_price, seller_url, seller_product_name, stock_status
@@ -189,7 +209,7 @@ def insert_to_postgres(product_results, seller_results):
             """
             # Deduplicate multiple offers from the same seller to avoid CardinalityViolation
             best_offers = {}
-            for r in seller_results:
+            for r in valid_seller_results:
                 p_code = str(r.get("product_id", r.get("product_code", ""))).strip()
                 s_name = str(r.get("seller", r.get("seller_name", ""))).strip()
                 price = parse_price(r.get("seller_price"))
@@ -257,7 +277,10 @@ def insert_to_postgres(product_results, seller_results):
                 status_lower = str(r.get("status", "")).strip().lower()
                 
                 # Determine correct scraping status and error message
-                if status_lower == 'completed' or status_lower == 'product_found':
+                if p_id in retry_product_ids:
+                    scr_status = 'pending'
+                    err_msg = 'Invalid product URL, retrying'
+                elif status_lower == 'completed' or status_lower == 'product_found':
                     scr_status = 'completed'
                     err_msg = None
                 elif status_lower == 'captcha_failed':
@@ -687,6 +710,60 @@ def reset_error_products_to_pending():
         return affected_rows
     except Exception as e:
         print(f"Error resetting error products to pending: {e}")
+        return 0
+
+def reset_invalid_url_products_for_retry():
+    """Reset all products that completed but had invalid URLs back to pending and delete their scraped results."""
+    try:
+        pg_host = os.environ.get("PG_HOST")
+        pg_port = os.environ.get("PG_PORT", "5432")
+        pg_user = os.environ.get("PG_USER")
+        pg_pass = os.environ.get("PG_PASS")
+        pg_db = os.environ.get("PG_DB")
+
+        conn = psycopg2.connect(host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db)
+        cursor = conn.cursor()
+        
+        # Select target product IDs that have invalid URLs (e.g. 1stopbedrooms or not ibp/share URLs)
+        select_query = """
+            SELECT product_id
+            FROM product_scraping_results
+            WHERE product_url NOT LIKE 'https://www.google.com/search?ibp=oshop%%'
+              AND product_url NOT LIKE 'https://share.google/%%'
+        """
+        cursor.execute(select_query)
+        target_ids = [row[0] for row in cursor.fetchall()]
+        
+        if target_ids:
+            # 1. Delete seller records for these products
+            cursor.execute("DELETE FROM product_sellers WHERE product_code = ANY(%s)", (target_ids,))
+            
+            # 2. Delete the scraping results for these products
+            cursor.execute("DELETE FROM product_scraping_results WHERE product_id = ANY(%s)", (target_ids,))
+            
+            # 3. Update products_to_scrape status to pending and clear claims/errors
+            cursor.execute(
+                """
+                UPDATE products_to_scrape
+                SET scraping_status = 'pending',
+                    error_message = NULL,
+                    claimed_by = NULL,
+                    claimed_at = NULL
+                WHERE product_id = ANY(%s)
+                """,
+                (target_ids,)
+            )
+            
+            conn.commit()
+            print(f"✓ Reset {len(target_ids)} products with invalid URLs back to pending and deleted their scraped results.")
+        else:
+            print("No completed products with invalid URLs to reset.")
+            
+        cursor.close()
+        conn.close()
+        return len(target_ids)
+    except Exception as e:
+        print(f"Error resetting invalid URL products for retry: {e}")
         return 0
 
 def generate_reconciliation_report(output_path):
@@ -1782,7 +1859,11 @@ def expand_more_stores(driver):
 
 def populate_offers_for_selected_product(driver, result, product_id, osb_url):
     result['competitors'] = []
-    result['product_url'] = extract_share_url(driver) or driver.current_url
+    raw_url = (extract_share_url(driver) or driver.current_url or "").strip()
+    if raw_url.startswith("https://www.google.com/search?ibp=oshop") or raw_url.startswith("https://share.google/"):
+        result['product_url'] = raw_url
+    else:
+        result['product_url'] = ""
 
     expand_more_stores(driver)
 
@@ -2518,6 +2599,7 @@ def main():
     # Handlers for dedicated utility commands
     if args.reset_errors:
         reset_error_products_to_pending()
+        reset_invalid_url_products_for_retry()
         sys.exit(0)
         
     if args.export_report:
@@ -2530,9 +2612,10 @@ def main():
     print(f"Recursive mode: {'Yes' if args.recursive else 'No'}")
     print("=" * 60)
     
-    # If this is the first chunk, automatically reset previous error products to pending so they are retried in this run
+    # If this is the first chunk, automatically reset previous error products and invalid URL products to pending so they are retried in this run
     if args.chunk_id == 1:
         reset_error_products_to_pending()
+        reset_invalid_url_products_for_retry()
     
     # Fetch total pending products count first (extremely fast)
     total_pending = get_pending_count_from_db()
