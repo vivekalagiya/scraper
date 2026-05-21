@@ -127,6 +127,118 @@ def build_search_url(name, mpn=None, color=None, bed_size_measure=None, mattress
     query = keyword.replace(' ', '+').replace('#', '')
     return f'https://www.google.com/search?q={query}&udm=28&gl=US&hl=en&pws=0'
 
+
+def initialize_product_result(product_id, keyword, product_url):
+    return {
+        'product_id': product_id,
+        'keyword': keyword,
+        'url': product_url,
+        'last_response': '',
+        'product_url': product_url,
+        'seller': '',
+        'product_name': '',
+        'cid': '',
+        'pid': '',
+        'last_fetched_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        'osb_position': 0,
+        'osb_id': '',
+        'seller_count': 0,
+        'status': 'pending',
+        'competitors': [],
+        'product_about_info': json.dumps({'description': '', 'attributes': {}, 'main_image': '', 'gs_images': []}),
+        'main_image': '',
+        'description': '',
+        'attributes': json.dumps({}),
+        'gs_images': json.dumps([]),
+        'rating_star': None,
+        'rating_count': None,
+        'typical_price_low': None,
+        'typical_price_high': None,
+        'best_price_url': '',
+        'popular_url': '',
+        'brand': None,
+        'color': None,
+        'width': None,
+        'height': None,
+        'depth': None,
+        'style': None,
+        'material': None,
+        'shape': None,
+        'assembly_required': None,
+        'weight': None
+    }
+
+
+def extract_mapped_attributes(attributes):
+    """
+    Extract specific fields from the attributes dictionary.
+    Keys are case-insensitive.
+    """
+    if not attributes or not isinstance(attributes, dict):
+        return {
+            'brand': None, 'color': None, 'width': None, 'height': None, 'depth': None,
+            'style': None, 'material': None, 'shape': None, 'assembly_required': None, 'weight': None
+        }
+        
+    mapped = {}
+    
+    # Helper to look up key case-insensitively
+    def get_val(keys):
+        for key in keys:
+            if key in attributes:
+                return str(attributes[key]).strip()
+            for k, v in attributes.items():
+                if k.lower() == key.lower():
+                    return str(v).strip()
+        return None
+
+    mapped['brand'] = get_val(['brand'])
+    mapped['color'] = get_val(['color'])
+    mapped['style'] = get_val(['style'])
+    mapped['material'] = get_val(['material'])
+    mapped['shape'] = get_val(['shape', 'product shape'])
+    mapped['assembly_required'] = get_val(['assembly required', 'assembly_required', 'assembly'])
+    mapped['weight'] = get_val(['weight', 'product weight', 'item weight', 'assembled weight'])
+
+    # Width, Height, Depth
+    width = get_val(['width', 'assembled width', 'product width'])
+    height = get_val(['height', 'assembled height', 'product height'])
+    depth = get_val(['depth', 'assembled depth', 'product depth', 'length', 'assembled length'])
+    
+    if not (width and height and depth):
+        dims_str = get_val(['dimensions', 'product dimensions', 'assembled dimensions'])
+        if dims_str:
+            match = re.search(
+                r"(\d+(?:\.\d+)?)\s*(?:in|inch|inches|cm|mm|')?\s*[xX*]\s*(\d+(?:\.\d+)?)\s*(?:in|inch|inches|cm|mm|')?\s*[xX*]\s*(\d+(?:\.\d+)?)\s*(?:in|inch|inches|cm|mm|')?",
+                dims_str
+            )
+            if match:
+                w_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:in|inch|inches|'|\")?\s*[wW]", dims_str)
+                h_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:in|inch|inches|'|\")?\s*[hH]", dims_str)
+                d_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:in|inch|inches|'|\")?\s*[dD]", dims_str)
+                
+                if w_match:
+                    width = w_match.group(1) + " in"
+                if h_match:
+                    height = h_match.group(1) + " in"
+                if d_match:
+                    depth = d_match.group(1) + " in"
+                
+                if not (width and height and depth):
+                    if not width:
+                        width = match.group(1) + " in"
+                    if not depth:
+                        depth = match.group(2) + " in"
+                    if not height:
+                        height = match.group(3) + " in"
+
+    mapped['width'] = width
+    mapped['height'] = height
+    mapped['depth'] = depth
+    
+    return mapped
+
+
 def insert_to_postgres(product_results, seller_results):
     def parse_jsonb_field(val):
         if not val:
@@ -179,7 +291,10 @@ def insert_to_postgres(product_results, seller_results):
         if valid_product_results:
             prod_insert = """
                 INSERT INTO google_shopping_results (
-                    product_id, google_title, google_description, gs_main_image, other_attributes,
+                    product_id, google_title, google_description, gs_main_image, gs_images,
+                    brand, color, width, height, depth, style, material, shape, assembly_required, weight,
+                    rating_star, rating_count, typical_price_low, typical_price_high,
+                    best_price_url, popular_url, other_attributes,
                     last_response, osb_url_match, google_seller_page_url, cid, pid,
                     osb_position, osb_id, seller_count, status, scraped_at, updated_at
                 ) VALUES %s
@@ -187,6 +302,23 @@ def insert_to_postgres(product_results, seller_results):
                     google_title = EXCLUDED.google_title,
                     google_description = EXCLUDED.google_description,
                     gs_main_image = EXCLUDED.gs_main_image,
+                    gs_images = EXCLUDED.gs_images,
+                    brand = EXCLUDED.brand,
+                    color = EXCLUDED.color,
+                    width = EXCLUDED.width,
+                    height = EXCLUDED.height,
+                    depth = EXCLUDED.depth,
+                    style = EXCLUDED.style,
+                    material = EXCLUDED.material,
+                    shape = EXCLUDED.shape,
+                    assembly_required = EXCLUDED.assembly_required,
+                    weight = EXCLUDED.weight,
+                    rating_star = EXCLUDED.rating_star,
+                    rating_count = EXCLUDED.rating_count,
+                    typical_price_low = EXCLUDED.typical_price_low,
+                    typical_price_high = EXCLUDED.typical_price_high,
+                    best_price_url = EXCLUDED.best_price_url,
+                    popular_url = EXCLUDED.popular_url,
                     other_attributes = EXCLUDED.other_attributes,
                     last_response = EXCLUDED.last_response,
                     osb_url_match = EXCLUDED.osb_url_match,
@@ -201,11 +333,65 @@ def insert_to_postgres(product_results, seller_results):
             """
             prod_values = []
             for r in valid_product_results:
+                gs_images_raw = r.get("gs_images", [])
+                if isinstance(gs_images_raw, str):
+                    try:
+                        gs_images_val = json.loads(gs_images_raw)
+                    except:
+                        gs_images_val = []
+                else:
+                    gs_images_val = gs_images_raw if isinstance(gs_images_raw, list) else []
+
+                rating_star_val = r.get("rating_star")
+                if rating_star_val is not None:
+                    try:
+                        rating_star_val = float(rating_star_val)
+                    except:
+                        rating_star_val = None
+                        
+                rating_count_val = r.get("rating_count")
+                if rating_count_val is not None:
+                    try:
+                        rating_count_val = int(rating_count_val)
+                    except:
+                        rating_count_val = None
+                        
+                typical_price_low_val = r.get("typical_price_low")
+                if typical_price_low_val is not None:
+                    try:
+                        typical_price_low_val = float(typical_price_low_val)
+                    except:
+                        typical_price_low_val = None
+                        
+                typical_price_high_val = r.get("typical_price_high")
+                if typical_price_high_val is not None:
+                    try:
+                        typical_price_high_val = float(typical_price_high_val)
+                    except:
+                        typical_price_high_val = None
+
                 prod_values.append((
                     str(r.get("product_id", "")),
-                    str(r.get("product_name", "")),
-                    str(r.get("description", "")),
-                    str(r.get("main_image", "")),
+                    str(r.get("google_title", r.get("product_name", ""))),
+                    str(r.get("google_description", r.get("description", ""))),
+                    str(r.get("gs_main_image", r.get("main_image", ""))),
+                    psycopg2.extras.Json(gs_images_val),
+                    r.get("brand"),
+                    r.get("color"),
+                    r.get("width"),
+                    r.get("height"),
+                    r.get("depth"),
+                    r.get("style"),
+                    r.get("material"),
+                    r.get("shape"),
+                    r.get("assembly_required"),
+                    r.get("weight"),
+                    rating_star_val,
+                    rating_count_val,
+                    typical_price_low_val,
+                    typical_price_high_val,
+                    str(r.get("best_price_url", "")),
+                    str(r.get("popular_url", "")),
                     psycopg2.extras.Json(parse_jsonb_field(r.get("attributes"))),
                     str(r.get("last_response", "")),
                     str(r.get("osb_url_match", "")),
@@ -267,7 +453,9 @@ def insert_to_postgres(product_results, seller_results):
 
             seller_insert = """
                 INSERT INTO google_shopping_sellers (
-                    product_id, competitor_id, seller_name, seller_product_name, seller_url, price, stock_status
+                    product_id, competitor_id, seller_name, seller_product_name, seller_url, price,
+                    original_price, discount_amount, coupon_code, coupon_remark, stock_status,
+                    seller_rating, delivery_tagline, google_position
                 ) VALUES %s
             """
             seller_values = []
@@ -283,6 +471,34 @@ def insert_to_postgres(product_results, seller_results):
                 if not comp_id:
                     continue
                 
+                orig_price = r.get("original_price")
+                if orig_price is not None:
+                    try:
+                        orig_price = float(orig_price)
+                    except:
+                        orig_price = None
+                
+                disc_amount = r.get("discount_amount")
+                if disc_amount is not None:
+                    try:
+                        disc_amount = float(disc_amount)
+                    except:
+                        disc_amount = None
+                
+                sel_rating = r.get("seller_rating")
+                if sel_rating is not None:
+                    try:
+                        sel_rating = float(sel_rating)
+                    except:
+                        sel_rating = None
+
+                google_pos = r.get("google_position")
+                if google_pos is not None:
+                    try:
+                        google_pos = int(google_pos)
+                    except:
+                        google_pos = None
+
                 seller_values.append((
                     p_code,
                     comp_id,
@@ -290,7 +506,14 @@ def insert_to_postgres(product_results, seller_results):
                     r.get("seller_product_name", ""),
                     r.get("seller_url", ""),
                     price,
-                    r.get("stock_status", "In Stock")
+                    orig_price,
+                    disc_amount,
+                    r.get("coupon_code", ""),
+                    r.get("coupon_remark", ""),
+                    r.get("stock_status", "In Stock"),
+                    sel_rating,
+                    r.get("delivery_tagline", ""),
+                    google_pos
                 ))
 
             if seller_values:
@@ -844,7 +1067,22 @@ def generate_reconciliation_report(output_path):
         # Fetch only products that have been scraped (non-pending status)
         products_df = pd.read_sql("SELECT product_id, name, gtin, brand, product_type AS category, keyword, url, scraping_status FROM osb_products WHERE scraping_status != 'pending'", conn)
         results_df = pd.read_sql("SELECT product_id, google_title AS product_name, seller_count, osb_position, updated_at, google_seller_page_url AS url, osb_url_match FROM google_shopping_results", conn)
-        sellers_df = pd.read_sql("SELECT product_id AS product_code, seller_name, price AS seller_price, seller_url, stock_status FROM google_shopping_sellers", conn)
+        sellers_df = pd.read_sql("""
+            SELECT 
+                product_id AS product_code, 
+                seller_name, 
+                price AS seller_price, 
+                seller_url, 
+                stock_status,
+                original_price,
+                discount_amount,
+                coupon_code,
+                coupon_remark,
+                seller_rating,
+                delivery_tagline,
+                google_position
+            FROM google_shopping_sellers
+        """, conn)
         conn.close()
 
         if products_df.empty:
@@ -983,11 +1221,25 @@ def generate_reconciliation_report(output_path):
                     'Stock': '',
                     'URL': '',
                     'OSB URL match': osb_url_match,
-                    'Scrapped url(google url)': scrapped_url
+                    'Scrapped url(google url)': scrapped_url,
+                    'Original Price': 0.00,
+                    'Discount Amount': 0.00,
+                    'Coupon Code': '',
+                    'Coupon Remark': '',
+                    'Seller Rating': '',
+                    'Delivery Tagline': ''
                 })
             else:
+                # Sort sellers by google_position, placing Null/None/NaN values at the end
+                sorted_sellers = sorted(
+                    p_sellers, 
+                    key=lambda x: (
+                        x.get('google_position') is None or pd.isna(x.get('google_position')), 
+                        float(x.get('google_position')) if (x.get('google_position') is not None and not pd.isna(x.get('google_position'))) else 999.0
+                    )
+                )
                 # Add a row for EACH competitor offer
-                for idx, s in enumerate(p_sellers):
+                for idx, s in enumerate(sorted_sellers):
                     s_name = s['seller_name']
                     try:
                         s_price = float(s['seller_price']) if s['seller_price'] is not None else 0.00
@@ -1008,6 +1260,30 @@ def generate_reconciliation_report(output_path):
                         else:
                             change_dir = 'Equal'
                             
+                    s_pos = s.get('google_position')
+                    if s_pos is not None and not pd.isna(s_pos):
+                        site_index = int(float(s_pos))
+                    else:
+                        site_index = idx + 1
+
+                    orig_price = s.get('original_price')
+                    orig_price = float(orig_price) if (orig_price is not None and not pd.isna(orig_price)) else 0.00
+                    
+                    disc_amount = s.get('discount_amount')
+                    disc_amount = float(disc_amount) if (disc_amount is not None and not pd.isna(disc_amount)) else 0.00
+
+                    coupon_code = s.get('coupon_code')
+                    coupon_code = str(coupon_code) if (coupon_code is not None and not pd.isna(coupon_code)) else ''
+
+                    coupon_remark = s.get('coupon_remark')
+                    coupon_remark = str(coupon_remark) if (coupon_remark is not None and not pd.isna(coupon_remark)) else ''
+
+                    sel_rating = s.get('seller_rating')
+                    sel_rating = float(sel_rating) if (sel_rating is not None and not pd.isna(sel_rating)) else None
+
+                    del_tagline = s.get('delivery_tagline')
+                    del_tagline = str(del_tagline) if (del_tagline is not None and not pd.isna(del_tagline)) else ''
+
                     report_rows.append({
                         'Product Name': prod_name,
                         'Product Code': p_id,
@@ -1030,13 +1306,19 @@ def generate_reconciliation_report(output_path):
                         'SmartPrice': smart_price,
                         'Last Update Cycle': last_update_cycle,
                         'Site': s_name,
-                        'Site Index': idx + 1, # 1-based index in offers list
+                        'Site Index': site_index,
                         'Total Price': s_price,
                         'Change direction': change_dir,
                         'Stock': s_stock,
                         'URL': s_url,
                         'OSB URL match': s_osb_match,
-                        'Scrapped url(google url)': scrapped_url
+                        'Scrapped url(google url)': scrapped_url,
+                        'Original Price': orig_price,
+                        'Discount Amount': disc_amount,
+                        'Coupon Code': coupon_code,
+                        'Coupon Remark': coupon_remark,
+                        'Seller Rating': sel_rating if sel_rating is not None else '',
+                        'Delivery Tagline': del_tagline
                     })
 
         report_df = pd.DataFrame(report_rows)
@@ -1048,7 +1330,9 @@ def generate_reconciliation_report(output_path):
             'Maximum Price (Total Price)', 'Average Price (Total Price)',
             'My Price', 'My Total Price', 'My Product Cost', 'Additional Cost',
             'SmartPrice', 'Last Update Cycle', 'Site', 'Site Index', 'Total Price',
-            'Change direction', 'Stock', 'URL', 'OSB URL match', 'Scrapped url(google url)'
+            'Change direction', 'Stock', 'URL', 'OSB URL match', 'Scrapped url(google url)',
+            'Original Price', 'Discount Amount', 'Coupon Code', 'Coupon Remark',
+            'Seller Rating', 'Delivery Tagline'
         ]
         report_df = report_df[COLUMNS_ORDER]
         report_df.to_csv(output_path, index=False)
@@ -1098,7 +1382,23 @@ PRODUCT_FINAL_COLUMNS = [
     "product_about_info",
     "main_image",
     "description",
-    "attributes"
+    "attributes",
+    "gs_images",
+    "color",
+    "width",
+    "height",
+    "depth",
+    "style",
+    "material",
+    "shape",
+    "assembly_required",
+    "weight",
+    "rating_star",
+    "rating_count",
+    "typical_price_low",
+    "typical_price_high",
+    "best_price_url",
+    "popular_url"
 ]
 # Import the existing captcha solving functions
 try:
@@ -1306,11 +1606,13 @@ def get_chrome_major_version():
         print(f"Error detecting Chrome version: {e}")
     return None
 
-def setup_driver(max_attempts=3, base_delay=4):
+def setup_driver(max_attempts=3, base_delay=4, headless=False):
     last_err = None
     
     def build_chrome_options():
         options = uc.ChromeOptions()
+        # if headless or os.environ.get("HEADLESS", "").lower() == "true":
+        #     options.add_argument("--headless")
         chrome_bin = os.environ.get("CHROME_BIN")
         if chrome_bin:
             options.binary_location = chrome_bin
@@ -1337,6 +1639,9 @@ def setup_driver(max_attempts=3, base_delay=4):
                 "options": options
             }
             
+            if headless or os.environ.get("HEADLESS", "").lower() == "true":
+                uc_kwargs["headless"] = True
+            
             if major_ver:
                 uc_kwargs["version_main"] = major_ver
             
@@ -1351,6 +1656,8 @@ def setup_driver(max_attempts=3, base_delay=4):
             driver = uc.Chrome(**uc_kwargs)
             normalize_driver_fingerprint(driver)
             warm_google_session(driver)
+            # Verify driver is healthy/responsive before returning
+            _ = driver.current_url
             return driver
 
         except Exception as e:
@@ -1624,7 +1931,13 @@ def get_product_about_info(driver):
     product_info = {
         'description': '',
         'attributes': {},
-        'main_image': ''
+        'main_image': '',
+        'gs_images': [],
+        'rating_star': None,
+        'rating_count': None,
+        'typical_price_low': None,
+        'typical_price_high': None,
+        'popular_url': ''
     }
     
     try:
@@ -1771,6 +2084,143 @@ def get_product_about_info(driver):
             print(f"Error extracting attributes: {str(e)}")
         
         print(f"Extracted {len(product_info['attributes'])} attributes")
+
+        # Extract all product images (gallery/thumbnails)
+        try:
+            print("Attempting to extract all product images...")
+            gallery_images = []
+            # 1. Standard img elements from typical containers
+            img_elements = driver.find_elements(By.XPATH, "//div[@jsname='HhYL2b']//img | //div[@jsname='SAt90e']//img | //div[contains(@class, 'm8U2Z')]//img | //div[@class='DqsAAd']//img | //div[contains(@class, 'FLY67')]//img | //div[contains(@class, 'sh-div__image-container')]//img | //img[@class='KfAt4d'] | //img[contains(@class, 'r429ob')]")
+            for img in img_elements:
+                try:
+                    src = img.get_attribute('srcset')
+                    if src:
+                        src = src.split(',')[0].split(' ')[0]
+                    if not src:
+                        src = img.get_attribute('src')
+                    if src and not src.startswith('data:') and src not in gallery_images:
+                        w = int(img.get_attribute('width') or 0)
+                        h = int(img.get_attribute('height') or 0)
+                        if (w > 0 and h > 0 and (w < 40 or h < 40)):
+                            continue
+                        if any(pattern in src for pattern in ['gstatic.com', 'googleusercontent.com', 'google.com']):
+                            gallery_images.append(src)
+                except:
+                    continue
+            
+            # 2. Carousel thumbnail div containers (class Asw3Oe) and any elements with data-src
+            data_src_elements = driver.find_elements(By.XPATH, "//div[contains(@class, 'Asw3Oe')] | //*[@data-src]")
+            for elem in data_src_elements:
+                try:
+                    src = elem.get_attribute('data-src')
+                    if src and not src.startswith('data:') and src not in gallery_images:
+                        if any(pattern in src for pattern in ['gstatic.com', 'googleusercontent.com', 'google.com']):
+                            gallery_images.append(src)
+                except:
+                    continue
+
+            product_info['gs_images'] = gallery_images
+            print(f"✓ Found {len(gallery_images)} product images")
+        except Exception as e:
+            print(f"Error extracting product gallery images: {str(e)}")
+            product_info['gs_images'] = []
+
+        # Extract product ratings
+        try:
+            print("Attempting to extract rating...")
+            rating_star = None
+            rating_count = None
+            rating_elements = driver.find_elements(By.XPATH, "//*[contains(@aria-label, 'out of 5')]")
+            for elem in rating_elements:
+                try:
+                    label = elem.get_attribute("aria-label")
+                    if label:
+                        match = re.search(r"([0-9.]+)\s*out of 5", label)
+                        if match:
+                            rating_star = float(match.group(1))
+                            # Check if the label also contains review/rating count (e.g. "Rated 4.5 out of 5, 180 user reviews")
+                            match_count = re.search(r"([\d,]+)\s*(?:user\s*)?reviews", label, re.IGNORECASE)
+                            if match_count:
+                                rating_count = int(match_count.group(1).replace(",", ""))
+                            break
+                except:
+                    pass
+            review_elements = driver.find_elements(By.XPATH, "//a[contains(text(), 'reviews') or contains(text(), 'ratings')] | //span[contains(text(), 'reviews') or contains(text(), 'ratings')]")
+            for elem in review_elements:
+                try:
+                    text = elem.text
+                    if text:
+                        match = re.search(r"(\d{1,3}(?:,\d{3})*)\s*(?:product\s*)?(?:reviews|ratings)", text, re.IGNORECASE)
+                        if match and rating_count is None:
+                            rating_count = int(match.group(1).replace(",", ""))
+                            break
+                except:
+                    pass
+            if not rating_count:
+                for elem in rating_elements:
+                    try:
+                        parent = elem.find_element(By.XPATH, "./..")
+                        parent_text = parent.text
+                        match = re.search(r"\(\s*(\d{1,3}(?:,\d{3})*)\s*\)", parent_text)
+                        if match:
+                            rating_count = int(match.group(1).replace(",", ""))
+                            break
+                    except:
+                        pass
+            product_info['rating_star'] = rating_star
+            product_info['rating_count'] = rating_count
+            print(f"✓ Rating: {rating_star} ({rating_count} reviews)")
+        except Exception as e:
+            print(f"Error extracting ratings: {str(e)}")
+            product_info['rating_star'] = None
+            product_info['rating_count'] = None
+
+        # Extract typical price range
+        try:
+            print("Attempting to extract typical price range...")
+            typical_price_low = None
+            typical_price_high = None
+            typical_elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'Typical price') or contains(text(), 'Typical range') or contains(text(), 'typical price') or contains(text(), 'typical range')]")
+            for elem in typical_elements:
+                try:
+                    text = elem.text
+                    if text:
+                        match = re.search(r"\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s*[-–—]\s*\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)", text)
+                        if match:
+                            typical_price_low = float(match.group(1).replace(",", ""))
+                            typical_price_high = float(match.group(2).replace(",", ""))
+                            break
+                except:
+                    pass
+            if not typical_price_low:
+                try:
+                    body_text = driver.find_element(By.TAG_NAME, "body").text
+                    for line in body_text.split('\n'):
+                        if "typical" in line.lower() and "$" in line:
+                            match = re.search(r"\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s*[-–—]\s*\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)", line)
+                            if match:
+                                typical_price_low = float(match.group(1).replace(",", ""))
+                                typical_price_high = float(match.group(2).replace(",", ""))
+                                break
+                except:
+                    pass
+            product_info['typical_price_low'] = typical_price_low
+            product_info['typical_price_high'] = typical_price_high
+            print(f"✓ Typical price range: {typical_price_low} - {typical_price_high}")
+        except Exception as e:
+            print(f"Error extracting typical price range: {str(e)}")
+            product_info['typical_price_low'] = None
+            product_info['typical_price_high'] = None
+
+        # Extract popular_url
+        try:
+            popular_url = ""
+            pop_elem = driver.find_elements(By.XPATH, "//a[contains(@href, 'popular') or contains(text(), 'Popular') or contains(text(), 'popular')]")
+            if pop_elem:
+                popular_url = pop_elem[0].get_attribute('href') or ""
+            product_info['popular_url'] = popular_url
+        except:
+            product_info['popular_url'] = ""
         
     except Exception as e:
         print(f"Error in get_product_about_info: {str(e)}")
@@ -1982,19 +2432,42 @@ def populate_offers_for_selected_product(driver, result, product_id, osb_url):
         result['description'] = about_data.get('description', '')
         result['attributes'] = json.dumps(about_data.get('attributes', {}))
         result['main_image'] = about_data.get('main_image', '')
-        print("✓ Product about info, description, attributes and image extracted")
+        result['gs_images'] = json.dumps(about_data.get('gs_images', []))
+        result['rating_star'] = about_data.get('rating_star')
+        result['rating_count'] = about_data.get('rating_count')
+        result['typical_price_low'] = about_data.get('typical_price_low')
+        result['typical_price_high'] = about_data.get('typical_price_high')
+        result['popular_url'] = about_data.get('popular_url', '')
+
+        # Extract mapped attributes and merge them into result
+        attr_dict = about_data.get('attributes', {})
+        mapped_attrs = extract_mapped_attributes(attr_dict)
+        result.update(mapped_attrs)
+
+        print("✓ Product about info, description, attributes, image, ratings, typical prices, and gallery extracted")
     except Exception as e:
         print(f"Error extracting product about info: {str(e)}")
-        result['product_about_info'] = json.dumps({'description': '', 'attributes': {}, 'main_image': ''})
+        result['product_about_info'] = json.dumps({'description': '', 'attributes': {}, 'main_image': '', 'gs_images': []})
         result['description'] = ''
         result['attributes'] = json.dumps({})
         result['main_image'] = ''
+        result['gs_images'] = json.dumps([])
+        result['rating_star'] = None
+        result['rating_count'] = None
+        result['typical_price_low'] = None
+        result['typical_price_high'] = None
+        result['popular_url'] = ''
+        
+        # Merge empty mapped attributes
+        mapped_attrs = extract_mapped_attributes({})
+        result.update(mapped_attrs)
 
     offer_elements = offers_grid.find_elements(By.CLASS_NAME, 'R5K7Cb')
     print(f"Found {len(offer_elements)} offers")
 
     competitors = []
-    for seller_html in offer_elements:
+    for idx, seller_html in enumerate(offer_elements):
+        google_position = idx + 1
         try:
             store_name = seller_html.find_element(By.CSS_SELECTOR, "div.hP4iBf.gUf0b.uWvFpd").text.strip()
         except Exception:
@@ -2031,13 +2504,92 @@ def populate_offers_for_selected_product(driver, result, product_id, osb_url):
         except Exception:
             stock_status = "In Stock"
 
+        # Extract original price
+        original_price = None
+        try:
+            old_price_el = seller_html.find_element(By.CSS_SELECTOR, "div.AoPnCe span[aria-hidden='true']")
+            original_price = parse_price(old_price_el.text)
+        except Exception:
+            try:
+                old_price_el = seller_html.find_element(By.CSS_SELECTOR, "div.AoPnCe")
+                original_price = parse_price(old_price_el.text)
+            except Exception:
+                try:
+                    old_price_el = seller_html.find_element(By.XPATH, ".//span[contains(@aria-label, 'Old price')]")
+                    original_price = parse_price(old_price_el.text)
+                except Exception:
+                    pass
+
+        # Compute discount amount
+        discount_amount = None
+        if original_price is not None:
+            parsed_price = parse_price(seller_price)
+            if parsed_price is not None:
+                discount_amount = original_price - parsed_price
+
+        # Extract seller rating
+        seller_rating = None
+        try:
+            rating_el = seller_html.find_element(By.CSS_SELECTOR, "span.NFq8Ad")
+            rating_text = rating_el.text.strip()
+            if "/" in rating_text:
+                seller_rating = parse_price(rating_text.split("/")[0])
+            else:
+                seller_rating = parse_price(rating_text)
+        except Exception:
+            try:
+                rating_el = seller_html.find_element(By.XPATH, ".//span[contains(@aria-label, 'Rated')]")
+                aria_label = rating_el.get_attribute("aria-label")
+                match = re.search(r"Rated\s+([\d.]+)", aria_label)
+                if match:
+                    seller_rating = float(match.group(1))
+            except Exception:
+                pass
+
+        # Extract delivery tagline
+        delivery_tagline = ""
+        try:
+            delivery_els = seller_html.find_elements(By.XPATH, ".//span[contains(@aria-label, 'delivery') or contains(@aria-label, 'Delivery') or contains(text(), 'delivery') or contains(text(), 'Delivery') or contains(text(), 'shipping') or contains(text(), 'Shipping')]")
+            for el in delivery_els:
+                text_val = el.get_attribute("aria-label") or el.text
+                text_val = text_val.strip()
+                if text_val:
+                    text_val = text_val.replace("·", "").strip()
+                    if text_val:
+                        delivery_tagline = text_val
+                        break
+        except Exception:
+            pass
+
+        # Extract coupon details
+        coupon_code = ""
+        coupon_remark = ""
+        try:
+            row_full_text = seller_html.text
+            code_match = re.search(r'(?:use\s+|with\s+)?code[:\s]+([A-Z0-9_-]{3,})', row_full_text, re.IGNORECASE)
+            if code_match:
+                coupon_code = code_match.group(1)
+            
+            remark_match = re.search(r'([\d%]+\s+off\s+with\s+code\s+[A-Z0-9_-]+|save\s+[\$\d.]+\s+with\s+code\s+[A-Z0-9_-]+|[\d%]+\s+coupon)', row_full_text, re.IGNORECASE)
+            if remark_match:
+                coupon_remark = remark_match.group(1)
+        except Exception:
+            pass
+
         competitor_data = {
             'product_id': product_id,
             'seller': store_name,
             'seller_product_name': seller_product_name,
             'seller_url': seller_url,
             'seller_price': seller_price,
+            'original_price': original_price,
+            'discount_amount': discount_amount,
+            'coupon_code': coupon_code,
+            'coupon_remark': coupon_remark,
             'stock_status': stock_status,
+            'seller_rating': seller_rating,
+            'delivery_tagline': delivery_tagline,
+            'google_position': google_position,
             'last_fetched_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
 
@@ -2062,12 +2614,24 @@ def populate_offers_for_selected_product(driver, result, product_id, osb_url):
                     osb_url_match = seller_slug == target_slug
                 break
 
+    # Calculate best_price_url from competitors
+    best_price_url = ""
+    min_price = float('inf')
+    for competitor in competitors:
+        price_str = competitor.get('seller_price', '')
+        if price_str and price_str != 'N/A':
+            parsed_p = parse_price(price_str)
+            if parsed_p is not None and parsed_p < min_price:
+                min_price = parsed_p
+                best_price_url = competitor.get('seller_url', '')
+
     result.update({
         'osb_position': osb_position,
         'seller_count': seller_count,
         'osb_id': osb_id,
         'status': 'completed',
         'osb_url_match': f'{"Yes" if osb_url_match else "No"}',
+        'best_price_url': best_price_url or "",
         'last_response': f'Completed - OSB Position: {osb_position}, Total Sellers: {seller_count}'
     })
     return result
@@ -2265,52 +2829,18 @@ def scrape_product_directly(driver, product_id, keyword, product_url, osb_url=""
         # Handle captcha before proceeding
         captcha_result = handle_captcha(driver, product_url)
         if captcha_result == "failed":
-            return {
-                'product_id': product_id,
-                'keyword': keyword,
-                'url': product_url,
+            result = initialize_product_result(product_id, keyword, product_url)
+            result.update({
                 'last_response': 'Captcha solving failed',
-                'status': 'captcha_failed',
-                'last_fetched_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'product_url': product_url,
-                'seller': '',
-                'product_name': '',
-                'cid': '',
-                'pid': '',
-                'osb_position': 0,
-                'osb_id': '',
-                'seller_count': 0,
-                'competitors': [],
-                'product_about_info': json.dumps({}),
-                'main_image': '',
-                'description': '',
-                'attributes': json.dumps({})
-            }
+                'status': 'captcha_failed'
+            })
+            return result
         
         time.sleep(random.uniform(4, 8))
         
         # Initialize result structure
-        result = {
-            'product_id': product_id,
-            'keyword': keyword,
-            'url': product_url,
-            'last_response': '',
-            'product_url': product_url,
-            'seller': '',
-            'product_name': '',
-            'cid': '',
-            'pid': '',
-            'last_fetched_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'osb_position': 0,
-            'osb_id': '',
-            'seller_count': 0,
-            'status': 'completed',
-            'competitors': [],
-            'product_about_info': '',
-            'main_image': '',
-            'description': '',
-            'attributes': ''
-        }
+        result = initialize_product_result(product_id, keyword, product_url)
+        result['status'] = 'completed'
         
         # Extract title from page
         page_title = extract_product_title_from_page(driver)
@@ -2328,51 +2858,23 @@ def scrape_product_directly(driver, product_id, keyword, product_url, osb_url=""
     except TimeoutException as e:
         print(f"Timeout error scraping product {product_id} (Direct): {str(e)}")
         traceback.print_exc()
-        return {
-            'product_id': product_id,
-            'keyword': keyword,
-            'url': product_url,
+        result = initialize_product_result(product_id, keyword, product_url)
+        result.update({
             'last_response': f'Timeout Error: {str(e)}',
             'status': 'timeout_error',
-            'last_fetched_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'product_url': product_url,
-            'seller': '',
-            'product_name': keyword,
-            'cid': '',
-            'pid': '',
-            'osb_position': 0,
-            'osb_id': '',
-            'seller_count': 0,
-            'competitors': [],
-            'product_about_info': json.dumps({}),
-            'main_image': '',
-            'description': '',
-            'attributes': json.dumps({})
-        }
+            'product_name': keyword
+        })
+        return result
     except Exception as e:
         print(f"Error scraping product {product_id} (Direct): {str(e)}")
         traceback.print_exc()
-        return {
-            'product_id': product_id,
-            'keyword': keyword,
-            'url': product_url,
+        result = initialize_product_result(product_id, keyword, product_url)
+        result.update({
             'last_response': f'Error: {str(e)}',
             'status': 'error',
-            'last_fetched_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'product_url': product_url,
-            'seller': '',
-            'product_name': keyword,
-            'cid': '',
-            'pid': '',
-            'osb_position': 0,
-            'osb_id': '',
-            'seller_count': 0,
-            'competitors': [],
-            'product_about_info': json.dumps({}),
-            'main_image': '',
-            'description': '',
-            'attributes': json.dumps({})
-        }
+            'product_name': keyword
+        })
+        return result
 
 def scrape_product(driver, product_id, keyword, url, osb_url=""):
     """Scrape individual product from Google Shopping"""
@@ -2390,52 +2892,17 @@ def scrape_product(driver, product_id, keyword, url, osb_url=""):
         # Handle captcha before proceeding
         captcha_result = handle_captcha(driver, url)
         if captcha_result == "failed":
-            return {
-                'product_id': product_id,
-                'keyword': keyword,
-                'url': url,
+            result = initialize_product_result(product_id, keyword, url)
+            result.update({
                 'last_response': 'Captcha solving failed',
-                'status': 'captcha_failed',
-                'last_fetched_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'product_url': '',  # ADD THIS LINE
-                'seller': '',  # ADD THIS LINE
-                'product_name': '',  # ADD THIS LINE
-                'cid': '',  # ADD THIS LINE
-                'pid': '',  # ADD THIS LINE
-                'osb_position': 0,  # ADD THIS LINE
-                'osb_id': '',  # ADD THIS LINE
-                'seller_count': 0,  # ADD THIS LINE
-                'competitors': [],  # Already present
-                'product_about_info': json.dumps({}),
-                'main_image': '',
-                'description': '',
-                'attributes': json.dumps({})
-            }
+                'status': 'captcha_failed'
+            })
+            return result
         
         time.sleep(random.uniform(4, 8))
         
         # Initialize result structure
-        result = {
-            'product_id': product_id,
-            'keyword': keyword,
-            'url': url,
-            'last_response': '',
-            'product_url': '',
-            'seller': '',
-            'product_name': '',
-            'cid': '',
-            'pid': '',
-            'last_fetched_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'osb_position': 0,
-            'osb_id': '',
-            'seller_count': 0,
-            'status': '',
-            'competitors': [],
-            'product_about_info': '',
-            'main_image': '',
-            'description': '',
-            'attributes': ''
-        }
+        result = initialize_product_result(product_id, keyword, url)
         
         try:
             phase_result, matched = run_product_selection_phase(
@@ -2472,51 +2939,21 @@ def scrape_product(driver, product_id, keyword, url, osb_url=""):
     except TimeoutException as e:
         print(f"Timeout error scraping product {product_id}: {str(e)}")
         traceback.print_exc()
-        return {
-            'product_id': product_id,
-            'keyword': keyword,
-            'url': url,
+        result = initialize_product_result(product_id, keyword, url)
+        result.update({
             'last_response': f'Timeout Error: {str(e)}',
-            'status': 'timeout_error',
-            'last_fetched_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'product_url': '',
-            'seller': '',
-            'product_name': '',
-            'cid': '',
-            'pid': '',
-            'osb_position': 0,
-            'osb_id': '',
-            'seller_count': 0,
-            'competitors': [],
-            'product_about_info': json.dumps({}),
-            'main_image': '',
-            'description': '',
-            'attributes': json.dumps({})
-        }
+            'status': 'timeout_error'
+        })
+        return result
     except Exception as e:
         print(f"Error scraping product {product_id}: {str(e)}")
         traceback.print_exc()
-        return {
-            'product_id': product_id,
-            'keyword': keyword,
-            'url': url,
+        result = initialize_product_result(product_id, keyword, url)
+        result.update({
             'last_response': f'Error: {str(e)}',
-            'status': 'error',
-            'last_fetched_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'product_url': '',
-            'seller': '',
-            'product_name': '',
-            'cid': '',
-            'pid': '',
-            'osb_position': 0,
-            'osb_id': '',
-            'seller_count': 0,
-            'competitors': [],
-            'product_about_info': json.dumps({}),
-            'main_image': '',
-            'description': '',
-            'attributes': json.dumps({})
-        }
+            'status': 'error'
+        })
+        return result
 
 def merge_csv_files(file_paths, output_path, sort_columns=None, expected_columns=None):
     """Merge CSV files into one output CSV."""
@@ -2774,7 +3211,23 @@ def process_chunk(df, chunk_id, total_chunks, round_id=1, output_dir='output', w
                 'product_about_info': result.get('product_about_info', json.dumps({})),
                 'main_image': result.get('main_image', ''),
                 'description': result.get('description', ''),
-                'attributes': result.get('attributes', json.dumps({}))
+                'attributes': result.get('attributes', json.dumps({})),
+                'gs_images': result.get('gs_images', json.dumps([])),
+                'color': result.get('color', None),
+                'width': result.get('width', None),
+                'height': result.get('height', None),
+                'depth': result.get('depth', None),
+                'style': result.get('style', None),
+                'material': result.get('material', None),
+                'shape': result.get('shape', None),
+                'assembly_required': result.get('assembly_required', None),
+                'weight': result.get('weight', None),
+                'rating_star': result.get('rating_star', None),
+                'rating_count': result.get('rating_count', None),
+                'typical_price_low': result.get('typical_price_low', None),
+                'typical_price_high': result.get('typical_price_high', None),
+                'best_price_url': result.get('best_price_url', ''),
+                'popular_url': result.get('popular_url', '')
             }
             csv1_data.append(csv1_row)
         
@@ -2790,7 +3243,14 @@ def process_chunk(df, chunk_id, total_chunks, round_id=1, output_dir='output', w
                 'seller_product_name': seller.get('seller_product_name', ''),
                 'seller_url': seller.get('seller_url', ''),
                 'seller_price': seller.get('seller_price', ''),
+                'original_price': seller.get('original_price', None),
+                'discount_amount': seller.get('discount_amount', None),
+                'coupon_code': seller.get('coupon_code', ''),
+                'coupon_remark': seller.get('coupon_remark', ''),
                 'stock_status': seller.get('stock_status', 'In Stock'),
+                'seller_rating': seller.get('seller_rating', None),
+                'delivery_tagline': seller.get('delivery_tagline', ''),
+                'google_position': seller.get('google_position', None),
                 'last_fetched_date': seller.get('last_fetched_date', '')
             }
             csv2_data.append(csv2_row)
