@@ -1,4 +1,6 @@
 import sys
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, message=".*pandas only supports SQLAlchemy connectable.*")
 import json
 import random
 import os
@@ -1402,18 +1404,7 @@ def generate_reconciliation_report(output_path):
         report_df.to_csv(output_path, index=False)
         print(f"✓ Reconciliation report saved successfully to: {output_path} ({len(report_rows)} rows)")
         
-        # Automatically upload to FTP if credentials are provided in the environment
-        ftp_host = os.environ.get("FTP_HOST")
-        ftp_user = os.environ.get("FTP_USER")
-        ftp_pass = os.environ.get("FTP_PASS")
-        ftp_path = os.environ.get("FTP_PATH", "/scrap")
-        
-        if ftp_host and ftp_user and ftp_pass:
-            remote_filename = os.path.basename(output_path)
-            upload_to_ftp(ftp_host, ftp_user, ftp_pass, ftp_path, output_path, remote_filename)
-        else:
-            print("Skipping FTP upload: Missing credentials (FTP_HOST, FTP_USER, or FTP_PASS)")
-            
+        # FTP upload has been disabled per user request
         return output_path
     except Exception as e:
         print(f"Error generating reconciliation report: {e}")

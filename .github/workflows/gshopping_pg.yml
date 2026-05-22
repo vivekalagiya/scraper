@@ -244,30 +244,3 @@ jobs:
             });
 
             core.info(`Triggered next round depth=${nextDepth}`);
-
-      - name: Generate and Upload Final Reconciliation Report
-        if: steps.check_rem.outputs.has_remaining == 'false'
-        id: report_gen
-        env:
-          PG_HOST: ${{ secrets.PG_HOST }}
-          PG_PORT: ${{ secrets.PG_PORT }}
-          PG_USER: ${{ secrets.PG_USER }}
-          PG_PASS: ${{ secrets.PG_PASS }}
-          PG_DB: ${{ secrets.PG_DB }}
-          FTP_HOST: ${{ secrets.FTP_HOST }}
-          FTP_PORT: ${{ secrets.FTP_PORT }}
-          FTP_USER: ${{ secrets.FTP_USER }}
-          FTP_PASS: ${{ secrets.FTP_PASS }}
-          FTP_PATH: ${{ secrets.FTP_PATH || '/scrap' }}
-        run: |
-          REPORT_NAME="final_reconciliation_report_$(date +'%Y%m%d_%H%M%S').csv"
-          python gshopping/gscraper_pg.py --export-report "$REPORT_NAME"
-          echo "report_name=$REPORT_NAME" >> "$GITHUB_OUTPUT"
-
-      - name: Upload Report Artifact to GitHub Workflow
-        if: steps.check_rem.outputs.has_remaining == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: google-shopping-reconciliation-report
-          path: ${{ steps.report_gen.outputs.report_name }}
-          if-no-files-found: error
