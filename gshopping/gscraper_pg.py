@@ -259,21 +259,17 @@ def insert_to_postgres(product_results, seller_results):
                 return {"raw_value": val}
         return val
 
-    try:
-        pg_host = os.environ.get("PG_HOST")
-        pg_port = os.environ.get("PG_PORT", "5432")
-        pg_user = os.environ.get("PG_USER")
-        pg_pass = os.environ.get("PG_PASS")
-        pg_db = os.environ.get("PG_DB")
+    pg_host = os.environ.get("PG_HOST")
+    pg_port = os.environ.get("PG_PORT", "5432")
+    pg_user = os.environ.get("PG_USER")
+    pg_pass = os.environ.get("PG_PASS")
+    pg_db = os.environ.get("PG_DB")
 
-        if not all([pg_host, pg_user, pg_pass, pg_db]):
-            print("Skipping PostgreSQL insert: Missing credentials")
-            return
+    if not all([pg_host, pg_user, pg_pass, pg_db]):
+        print("Skipping PostgreSQL insert: Missing credentials")
+        return
 
-        conn = psycopg2.connect(
-            host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db
-        )
-        cursor = conn.cursor()
+    def execute_transaction(conn, cursor):
 
         # Identify retryable product IDs (completed but missing a valid product_url)
         retry_product_ids = set()
@@ -453,7 +449,12 @@ def insert_to_postgres(product_results, seller_results):
                     SET base_url = EXCLUDED.base_url
                     WHERE competitors.base_url IS NULL OR competitors.base_url = ''
                 """
-                execute_values(cursor, competitor_insert, [(name, base) for name, base in competitor_data.items()])
+                # Sort competitors alphabetically by competitor_name to prevent database deadlocks under concurrency
+                sorted_competitor_tuples = sorted(
+                    [(name, base) for name, base in competitor_data.items()],
+                    key=lambda x: x[0]
+                )
+                execute_values(cursor, competitor_insert, sorted_competitor_tuples)
                 
                 cursor.execute("SELECT competitor_id, competitor_name FROM competitors WHERE competitor_name = ANY(%s)", (list(competitor_data.keys()),))
                 competitor_map = {name: cid for cid, name in cursor.fetchall()}
@@ -592,9 +593,45 @@ def insert_to_postgres(product_results, seller_results):
         conn.close()
         print(f"✓ Transaction committed: Upserted {len(product_results)} products and {len(seller_results)} sellers into PostgreSQL.")
 
-    except Exception as e:
-        print(f"Error inserting into PostgreSQL: {e}")
-        traceback.print_exc()
+    max_attempts = 5
+    base_delay = 0.5
+    for attempt in range(1, max_attempts + 1):
+        conn = None
+        cursor = None
+        try:
+            conn = psycopg2.connect(
+                host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db
+            )
+            cursor = conn.cursor()
+            execute_transaction(conn, cursor)
+            return
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+            is_transient = any(word in str(e).lower() for word in ["deadlock", "lock", "serialization", "concurrent", "timeout", "connection", "aborted"])
+            if is_transient and attempt < max_attempts:
+                import random
+                sleep_time = base_delay * (2 ** (attempt - 1)) + random.uniform(0.1, 1.0)
+                print(f"Database concurrency conflict or deadlock detected ({e}). Retrying in {sleep_time:.2f}s (Attempt {attempt}/{max_attempts})...")
+                time.sleep(sleep_time)
+            else:
+                print(f"Error inserting into PostgreSQL after {attempt} attempts: {e}")
+                traceback.print_exc()
+                break
 
 def sync_csv_to_db(csv_path):
     """Import CSV data into osb_products table in fast batches if not already present."""
