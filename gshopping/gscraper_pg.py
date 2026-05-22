@@ -442,22 +442,46 @@ def insert_to_postgres(product_results, seller_results):
                     competitor_data[s_name] = base_url
 
             if competitor_data:
-                competitor_insert = """
-                    INSERT INTO competitors (competitor_name, base_url)
-                    VALUES %s
-                    ON CONFLICT (competitor_name) DO UPDATE
-                    SET base_url = EXCLUDED.base_url
-                    WHERE competitors.base_url IS NULL OR competitors.base_url = ''
-                """
-                # Sort competitors alphabetically by competitor_name to prevent database deadlocks under concurrency
-                sorted_competitor_tuples = sorted(
-                    [(name, base) for name, base in competitor_data.items()],
-                    key=lambda x: x[0]
+                # 1. Query existing competitors first to minimize locks/deadlocks
+                cursor.execute(
+                    "SELECT competitor_id, competitor_name, base_url FROM competitors WHERE competitor_name = ANY(%s)",
+                    (list(competitor_data.keys()),)
                 )
-                execute_values(cursor, competitor_insert, sorted_competitor_tuples)
+                existing_competitors = {row[1]: (row[0], row[2] or '') for row in cursor.fetchall()}
                 
-                cursor.execute("SELECT competitor_id, competitor_name FROM competitors WHERE competitor_name = ANY(%s)", (list(competitor_data.keys()),))
-                competitor_map = {name: cid for cid, name in cursor.fetchall()}
+                # 2. Filter list: we only insert or update if they don't exist OR if we have a new base_url and the existing one is empty
+                competitors_to_insert = []
+                competitor_map = {}
+                
+                for name, base_url in competitor_data.items():
+                    if name in existing_competitors:
+                        cid, existing_base = existing_competitors[name]
+                        competitor_map[name] = cid
+                        # If the existing base_url is empty but our scraped base_url is not, we want to update it
+                        if not existing_base and base_url:
+                            competitors_to_insert.append((name, base_url))
+                    else:
+                        # Competitor doesn't exist, we must insert it
+                        competitors_to_insert.append((name, base_url))
+                
+                # 3. Only run the INSERT/UPDATE if there's actually something to write
+                if competitors_to_insert:
+                    competitor_insert = """
+                        INSERT INTO competitors (competitor_name, base_url)
+                        VALUES %s
+                        ON CONFLICT (competitor_name) DO UPDATE
+                        SET base_url = EXCLUDED.base_url
+                        WHERE competitors.base_url IS NULL OR competitors.base_url = ''
+                    """
+                    # Sort alphabetically by competitor_name to prevent database deadlocks under concurrency
+                    sorted_competitor_tuples = sorted(competitors_to_insert, key=lambda x: x[0])
+                    execute_values(cursor, competitor_insert, sorted_competitor_tuples)
+                    
+                    # Refresh the competitor_map for the newly inserted competitors
+                    new_names = [x[0] for x in competitors_to_insert]
+                    cursor.execute("SELECT competitor_id, competitor_name FROM competitors WHERE competitor_name = ANY(%s)", (new_names,))
+                    for cid, name in cursor.fetchall():
+                        competitor_map[name] = cid
             else:
                 competitor_map = {}
 
@@ -635,6 +659,8 @@ def insert_to_postgres(product_results, seller_results):
 
 def sync_csv_to_db(csv_path):
     """Import CSV data into osb_products table in fast batches if not already present."""
+    conn = None
+    cursor = None
     try:
         pg_host = os.environ.get("PG_HOST")
         pg_port = os.environ.get("PG_PORT", "5432")
@@ -664,8 +690,6 @@ def sync_csv_to_db(csv_path):
         existing_count = cursor.fetchone()[0]
         if existing_count > 0:
             print(f"✓ Database already contains {existing_count} products. Skipping CSV sync to save time.")
-            cursor.close()
-            conn.close()
             return
 
         print(f"Reading CSV {csv_path} for sync...")
@@ -739,16 +763,27 @@ def sync_csv_to_db(csv_path):
                         conn.rollback()
                         print(f"Failed to import sub-batch starting at index {i+j}: {sub_err}")
         
-        cursor.close()
-        conn.close()
         print("✓ CSV sync to DB completed.")
     except Exception as e:
         print(f"Error syncing CSV to DB: {e}")
         traceback.print_exc()
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def get_pending_count_from_db():
     """Get the lightweight count of enabled products with 'pending' scraping_status."""
+    conn = None
+    cursor = None
     try:
         pg_host = os.environ.get("PG_HOST")
         pg_port = os.environ.get("PG_PORT", "5432")
@@ -760,12 +795,21 @@ def get_pending_count_from_db():
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM osb_products WHERE scraping_status = 'pending' AND status = 1")
         count = cursor.fetchone()[0]
-        cursor.close()
-        conn.close()
         return count
     except Exception as e:
         print(f"Error getting pending count from DB: {e}")
         return 0
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def _get_pg_conn():
     pg_host = os.environ.get("PG_HOST")
@@ -809,6 +853,8 @@ def calculate_parallel_claim_limit(claim_limit=None, products_per_hour=DEFAULT_P
 
 def release_expired_claims(ttl_minutes=60):
     """Release old claims so another runner can pick them up."""
+    conn = None
+    cursor = None
     try:
         conn = _get_pg_conn()
         cursor = conn.cursor()
@@ -826,20 +872,31 @@ def release_expired_claims(ttl_minutes=60):
         )
         released = cursor.rowcount
         conn.commit()
-        cursor.close()
-        conn.close()
         if released:
             print(f"✓ Released {released} expired claimed products (TTL={ttl_minutes}m).")
         return released
     except Exception as e:
         print(f"Error releasing expired claims: {e}")
         return 0
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def claim_pending_products_from_db(limit=30, worker_id=None, ttl_minutes=60):
     """
     Atomically claim up to `limit` pending products using row locks (FOR UPDATE SKIP LOCKED).
     Requires columns: claimed_by, claimed_at; and supports scraping_status='claimed'.
     """
+    conn = None
+    cursor = None
     try:
         worker_id = _get_worker_id(worker_id)
         conn = _get_pg_conn()
@@ -862,8 +919,6 @@ def claim_pending_products_from_db(limit=30, worker_id=None, ttl_minutes=60):
         except Exception:
             conn.rollback()
             # If schema doesn't have claim columns yet, let the caller know via empty df.
-            cursor.close()
-            conn.close()
             return pd.DataFrame()
 
         cursor.execute(
@@ -891,15 +946,25 @@ def claim_pending_products_from_db(limit=30, worker_id=None, ttl_minutes=60):
         rows = cursor.fetchall()
         cols = [d[0] for d in cursor.description] if cursor.description else []
         conn.commit()
-        cursor.close()
-        conn.close()
         return pd.DataFrame(rows, columns=cols)
     except Exception as e:
         print(f"Error claiming pending products from DB: {e}")
         return pd.DataFrame()
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def get_pending_chunk_from_db(limit, offset):
     """Fetch only a specific partitioned slice of pending products using SQL LIMIT and OFFSET."""
+    conn = None
     try:
         pg_host = os.environ.get("PG_HOST")
         pg_port = os.environ.get("PG_PORT", "5432")
@@ -917,11 +982,16 @@ def get_pending_chunk_from_db(limit, offset):
             LIMIT %s OFFSET %s
         """
         df = pd.read_sql(query, conn, params=(int(limit), int(offset)))
-        conn.close()
         return df
     except Exception as e:
         print(f"Error fetching pending chunk from DB: {e}")
         return pd.DataFrame()
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def verify_and_claim_product(product_id, worker_id=None, ttl_minutes=60):
     """
@@ -929,6 +999,8 @@ def verify_and_claim_product(product_id, worker_id=None, ttl_minutes=60):
     Returns True if we successfully claimed/renewed it and can scrape it.
     Returns False if it is completed, failed, or claimed by someone else.
     """
+    conn = None
+    cursor = None
     try:
         pg_host = os.environ.get("PG_HOST")
         pg_port = os.environ.get("PG_PORT", "5432")
@@ -965,13 +1037,9 @@ def verify_and_claim_product(product_id, worker_id=None, ttl_minutes=60):
             )
             row = cursor.fetchone()
             if not row:
-                cursor.close()
-                conn.close()
                 return False
             status = row[0]
             if status != PENDING_STATUS:
-                cursor.close()
-                conn.close()
                 return False
             
             # Atomically set to claimed
@@ -981,8 +1049,6 @@ def verify_and_claim_product(product_id, worker_id=None, ttl_minutes=60):
             )
             claimed = cursor.rowcount > 0
             conn.commit()
-            cursor.close()
-            conn.close()
             return claimed
 
         # With claims support, atomically claim or renew our claim
@@ -1005,15 +1071,26 @@ def verify_and_claim_product(product_id, worker_id=None, ttl_minutes=60):
         )
         claimed = cursor.rowcount > 0
         conn.commit()
-        cursor.close()
-        conn.close()
         return claimed
     except Exception as e:
         print(f"Error verifying/claiming product {product_id} in DB: {e}")
         return True
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def update_product_status(product_id, scraping_status, error_message=None):
     """Update the scraping_status of a product in the osb_products table."""
+    conn = None
+    cursor = None
     try:
         conn = _get_pg_conn()
         cursor = conn.cursor()
@@ -1037,10 +1114,19 @@ def update_product_status(product_id, scraping_status, error_message=None):
                 (scraping_status, error_message, str(product_id)),
             )
         conn.commit()
-        cursor.close()
-        conn.close()
     except Exception as e:
         print(f"Error updating status for {product_id}: {e}")
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def release_claimed_products(product_ids, worker_id=None, reason="not_processed"):
     """Return unprocessed rows claimed by this worker to the pending queue."""
@@ -1048,6 +1134,8 @@ def release_claimed_products(product_ids, worker_id=None, reason="not_processed"
     if not product_ids:
         return 0
 
+    conn = None
+    cursor = None
     try:
         resolved_worker_id = _get_worker_id(worker_id)
         conn = _get_pg_conn()
@@ -1067,17 +1155,28 @@ def release_claimed_products(product_ids, worker_id=None, reason="not_processed"
         )
         released = cursor.rowcount
         conn.commit()
-        cursor.close()
-        conn.close()
         if released:
             print(f"✓ Released {released} unprocessed claimed products back to pending ({reason}).")
         return released
     except Exception as e:
         print(f"Error releasing unprocessed claimed products: {e}")
         return 0
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def reset_error_products_to_pending():
     """Reset all products with 'error' scraping_status to 'pending' to retry them."""
+    conn = None
+    cursor = None
     try:
         pg_host = os.environ.get("PG_HOST")
         pg_port = os.environ.get("PG_PORT", "5432")
@@ -1092,17 +1191,28 @@ def reset_error_products_to_pending():
         )
         conn.commit()
         affected_rows = cursor.rowcount
-        cursor.close()
-        conn.close()
         if affected_rows > 0:
             print(f"✓ Reset {affected_rows} failed products from 'error' to 'pending' for retry.")
         return affected_rows
     except Exception as e:
         print(f"Error resetting error products to pending: {e}")
         return 0
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def reset_invalid_url_products_for_retry():
     """Reset all products that completed but had invalid URLs back to pending and delete their scraped results."""
+    conn = None
+    cursor = None
     try:
         pg_host = os.environ.get("PG_HOST")
         pg_port = os.environ.get("PG_PORT", "5432")
@@ -1150,64 +1260,80 @@ def reset_invalid_url_products_for_retry():
         else:
             print("No completed products with invalid URLs to reset.")
             
-        cursor.close()
-        conn.close()
         return len(target_ids)
     except Exception as e:
         print(f"Error resetting invalid URL products for retry: {e}")
         return 0
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def generate_reconciliation_report(output_path):
     """Query the database and compile the detailed flat reconciliation CSV report."""
+    conn = None
     try:
-        pg_host = os.environ.get("PG_HOST")
-        pg_port = os.environ.get("PG_PORT", "5432")
-        pg_user = os.environ.get("PG_USER")
-        pg_pass = os.environ.get("PG_PASS")
-        pg_db = os.environ.get("PG_DB")
+        try:
+            pg_host = os.environ.get("PG_HOST")
+            pg_port = os.environ.get("PG_PORT", "5432")
+            pg_user = os.environ.get("PG_USER")
+            pg_pass = os.environ.get("PG_PASS")
+            pg_db = os.environ.get("PG_DB")
 
-        conn = psycopg2.connect(host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db)
-        
-        # Fetch only products that have been scraped (non-pending status) and are active (status = 1)
-        products_df = pd.read_sql("SELECT product_id, name, gtin, brand, product_type AS category, keyword, url, scraping_status FROM osb_products WHERE scraping_status != 'pending' AND status = 1", conn)
-        results_df = pd.read_sql(
-            """
-            SELECT 
-                r.product_id, 
-                r.google_title AS product_name, 
-                r.seller_count, 
-                r.osb_position, 
-                r.updated_at, 
-                r.google_seller_page_url AS url, 
-                r.osb_url_match 
-            FROM google_shopping_results r
-            JOIN osb_products p ON r.product_id = p.product_id
-            WHERE p.status = 1
-            """,
-            conn
-        )
-        sellers_df = pd.read_sql(
-            """
-            SELECT 
-                s.product_id AS product_code, 
-                s.seller_name, 
-                s.price AS seller_price, 
-                s.seller_url, 
-                s.stock_status,
-                s.original_price,
-                s.discount_amount,
-                s.coupon_code,
-                s.coupon_remark,
-                s.seller_rating,
-                s.delivery_tagline,
-                s.google_position
-            FROM google_shopping_sellers s
-            JOIN osb_products p ON s.product_id = p.product_id
-            WHERE p.status = 1
-            """,
-            conn
-        )
-        conn.close()
+            conn = psycopg2.connect(host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db)
+            
+            # Fetch only products that have been scraped (non-pending status) and are active (status = 1)
+            products_df = pd.read_sql("SELECT product_id, name, gtin, brand, product_type AS category, keyword, url, scraping_status FROM osb_products WHERE scraping_status != 'pending' AND status = 1", conn)
+            results_df = pd.read_sql(
+                """
+                SELECT 
+                    r.product_id, 
+                    r.google_title AS product_name, 
+                    r.seller_count, 
+                    r.osb_position, 
+                    r.updated_at, 
+                    r.google_seller_page_url AS url, 
+                    r.osb_url_match 
+                FROM google_shopping_results r
+                JOIN osb_products p ON r.product_id = p.product_id
+                WHERE p.status = 1
+                """,
+                conn
+            )
+            sellers_df = pd.read_sql(
+                """
+                SELECT 
+                    s.product_id AS product_code, 
+                    s.seller_name, 
+                    s.price AS seller_price, 
+                    s.seller_url, 
+                    s.stock_status,
+                    s.original_price,
+                    s.discount_amount,
+                    s.coupon_code,
+                    s.coupon_remark,
+                    s.seller_rating,
+                    s.delivery_tagline,
+                    s.google_position
+                FROM google_shopping_sellers s
+                JOIN osb_products p ON s.product_id = p.product_id
+                WHERE p.status = 1
+                """,
+                conn
+            )
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
         if products_df.empty:
             print("No products found in DB to generate report.")
@@ -2880,6 +3006,8 @@ def run_product_selection_phase(driver, product_id, phase_name, search_url, base
 
 def get_existing_product_url_from_db(product_id):
     """Retrieve existing valid product_url from google_shopping_results if available."""
+    conn = None
+    cursor = None
     try:
         conn = _get_pg_conn()
         cursor = conn.cursor()
@@ -2888,8 +3016,6 @@ def get_existing_product_url_from_db(product_id):
             (str(product_id),)
         )
         row = cursor.fetchone()
-        cursor.close()
-        conn.close()
         if row and row[0]:
             p_url = row[0].strip()
             is_valid_url = p_url.startswith("https://www.google.com/search?ibp=oshop") or p_url.startswith("https://share.google/")
@@ -2899,6 +3025,17 @@ def get_existing_product_url_from_db(product_id):
     except Exception as e:
         print(f"Error fetching existing product_url from DB for {product_id}: {e}")
         return None
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def extract_product_title_from_page(driver):
     """Attempt to extract product title from the direct Google Shopping page."""
