@@ -245,66 +245,67 @@ def main():
         
         print(f"Total matching product IDs: {len(product_ids)}")
         
-        CHUNK_SIZE = 10000
-        products_frames = []
-        results_frames = []
+        print("Fetching products and scraped results in single-roundtrip queries...")
+        products_df = safe_read_sql(
+            """
+            SELECT 
+                p.product_id, 
+                p.name, 
+                p.gtin, 
+                p.brand, 
+                p.product_type AS category, 
+                p.keyword, 
+                p.url, 
+                p.osb_url, 
+                p.price, 
+                p.margin, 
+                p.scraping_status 
+            FROM osb_products p
+            JOIN google_shopping_results r ON p.product_id = r.product_id
+            WHERE p.status = 1 
+              AND p.scraping_status = 'completed'
+            """,
+            params=None,
+            conn_holder=conn_holder
+        )
+        
+        results_df = safe_read_sql(
+            """
+            SELECT 
+                r.product_id, 
+                r.google_title, 
+                r.seller_count, 
+                r.osb_position, 
+                r.updated_at, 
+                r.google_seller_page_url, 
+                r.osb_url_match 
+            FROM google_shopping_results r
+            JOIN osb_products p ON p.product_id = r.product_id
+            WHERE p.status = 1 
+              AND p.scraping_status = 'completed'
+            """,
+            params=None,
+            conn_holder=conn_holder
+        )
+
+        CHUNK_SIZE = 1000
         sellers_frames = []
         
         total_chunks = (len(product_ids) + CHUNK_SIZE - 1) // CHUNK_SIZE
         for idx, offset in enumerate(range(0, len(product_ids), CHUNK_SIZE), 1):
             chunk_ids = product_ids[offset:offset+CHUNK_SIZE]
-            print(f"Fetching chunk {idx} of {total_chunks} ({len(chunk_ids)} products)...")
-            
-            p_df = safe_read_sql(
-                """
-                SELECT 
-                    p.product_id, 
-                    p.name, 
-                    p.gtin, 
-                    p.brand, 
-                    p.product_type AS category, 
-                    p.keyword, 
-                    p.url, 
-                    p.osb_url, 
-                    p.price, 
-                    p.margin, 
-                    p.scraping_status 
-                FROM osb_products p
-                WHERE p.product_id = ANY(%s)
-                """,
-                params=(chunk_ids,),
-                conn_holder=conn_holder
-            )
-            products_frames.append(p_df)
-            
-            r_df = safe_read_sql(
-                """
-                SELECT 
-                    r.product_id, 
-                    r.google_title, 
-                    r.seller_count, 
-                    r.osb_position, 
-                    r.updated_at, 
-                    r.google_seller_page_url, 
-                    r.osb_url_match 
-                FROM google_shopping_results r
-                WHERE r.product_id = ANY(%s)
-                """,
-                params=(chunk_ids,),
-                conn_holder=conn_holder
-            )
-            results_frames.append(r_df)
+            print(f"Fetching sellers chunk {idx} of {total_chunks} ({len(chunk_ids)} products)...")
             
             s_df = safe_read_sql(
                 """
                 SELECT 
                     s.product_id, 
-                    s.seller_name, 
+                    COALESCE(s.seller_name, '') AS seller_name, 
                     s.price AS seller_price, 
-                    s.seller_url, 
-                    s.stock_status,
-                    s.site_display,
-                    s.is_me
+                    COALESCE(s.seller_url, '') AS seller_url, 
+                    COALESCE(s.stock_status, 'In Stock') AS stock_status,
+                    COALESCE(s.site_display, '') AS site_display,
+                    COALESCE(s.is_me, FALSE) AS is_me
                 FROM google_shopping_sellers s
                 WHERE s.product_id = ANY(%s)
                 """,
@@ -313,8 +314,6 @@ def main():
             )
             sellers_frames.append(s_df)
             
-        products_df = pd.concat(products_frames, ignore_index=True) if products_frames else pd.DataFrame()
-        results_df = pd.concat(results_frames, ignore_index=True) if results_frames else pd.DataFrame()
         sellers_df = pd.concat(sellers_frames, ignore_index=True) if sellers_frames else pd.DataFrame()
         
     except Exception as e:
@@ -337,15 +336,10 @@ def main():
 
     now_dt = datetime.now()
     
-    # 1. Prepare and clean sellers_df
-    sellers_clean = sellers_df.copy()
+    # 1. Prepare and clean sellers_df in-place (saves huge memory allocations)
+    sellers_clean = sellers_df
     sellers_clean['seller_price'] = pd.to_numeric(sellers_clean['seller_price'], errors='coerce')
-    
-    sellers_clean['seller_name'] = sellers_clean['seller_name'].fillna('')
-    sellers_clean['seller_url'] = sellers_clean['seller_url'].fillna('')
-    sellers_clean['stock_status'] = sellers_clean['stock_status'].fillna('In Stock')
-    sellers_clean['site_display'] = sellers_clean['site_display'].fillna('')
-    sellers_clean['is_me'] = sellers_clean['is_me'].fillna(False).astype(bool)
+    sellers_clean['is_me'] = sellers_clean['is_me'].astype(bool)
     
     # 2. Compute my_price per product
     me_sellers = sellers_clean[sellers_clean['is_me']]
@@ -414,23 +408,14 @@ def main():
     products['avg_price'] = products['avg_price'].round(2)
     
     # 6. Cheapest & highest sites
-    offers_df = sellers_clean[sellers_clean['seller_price'].notna()][['product_id', 'site_display', 'seller_price']].copy()
+    offers_df = sellers_clean[sellers_clean['seller_price'].notna()][['product_id', 'site_display', 'seller_price']]
     
-    all_offers_df = offers_df
-    all_offers_df['order'] = range(len(all_offers_df))
+    # O(N) single-pass lookup of cheapest and highest price indices (no sorting!)
+    idx_min = offers_df.groupby('product_id')['seller_price'].idxmin()
+    idx_max = offers_df.groupby('product_id')['seller_price'].idxmax()
     
-    cheapest_offers = all_offers_df.sort_values(
-        by=['product_id', 'seller_price', 'order'],
-        ascending=[True, True, True]
-    ).drop_duplicates(subset=['product_id'], keep='first')
-    
-    highest_offers = all_offers_df.sort_values(
-        by=['product_id', 'seller_price', 'order'],
-        ascending=[True, False, True]
-    ).drop_duplicates(subset=['product_id'], keep='first')
-    
-    products['cheapest_site'] = products['product_id'].map(cheapest_offers.set_index('product_id')['site_display']).fillna('')
-    products['highest_site'] = products['product_id'].map(highest_offers.set_index('product_id')['site_display']).fillna('')
+    products['cheapest_site'] = products['product_id'].map(offers_df.loc[idx_min].set_index('product_id')['site_display']).fillna('')
+    products['highest_site'] = products['product_id'].map(offers_df.loc[idx_max].set_index('product_id')['site_display']).fillna('')
     
     # 7. Position & Index
     products['my_position'] = "I am in the middle"
@@ -470,37 +455,36 @@ def main():
         'is_me': sellers_clean['is_me']
     })
     
-    processed_sellers_df = sellers_sub
+    report_df = products.merge(sellers_sub, on='product_id', how='left')
     
-    report_df = products.merge(processed_sellers_df, on='product_id', how='left')
-    
-    # 10. Construct output DataFrames
-    df1 = pd.DataFrame()
-    df1['Product Name'] = report_df['google_title'].fillna(report_df['name']).fillna('')
-    df1['Product Code'] = report_df['product_id']
-    df1['Barcode'] = report_df['gtin'].fillna('')
-    df1['Brand'] = report_df['brand'].fillna('')
-    df1['Category'] = report_df['category'].fillna('')
-    df1['Product Tags'] = '-'
-    df1['Number of Matches'] = report_df['comp_count']
-    df1['My Index'] = report_df['my_index']
-    df1['My Position'] = report_df['my_position']
-    df1['Cheapest Site'] = report_df['cheapest_site']
-    df1['Highest Site'] = report_df['highest_site']
-    df1['Minimum Price'] = report_df['min_price']
-    df1['Maximum Price'] = report_df['max_price']
-    df1['Average Price'] = report_df['avg_price']
-    df1['My Price'] = report_df['my_price']
-    df1['My Product Cost'] = report_df['my_product_cost']
-    df1['Additional Cost'] = 0
-    df1['SmartPrice'] = '-'
-    df1['Last Update Cycle'] = report_df['last_update_cycle']
-    df1['Site'] = report_df['site_display'].fillna('')
-    df1['Site Index'] = '-'
-    df1['Price'] = report_df['s_price'].fillna(0.00)
-    df1['Change direction'] = '-'
-    df1['Stock'] = report_df['s_stock'].fillna('')
-    df1['URL'] = report_df['s_url'].fillna(report_df['osb_url']).fillna('')
+    # 10. Construct output DataFrames (efficiently using dict for single memory allocation)
+    df1_data = {
+        'Product Name': report_df['google_title'].fillna(report_df['name']).fillna(''),
+        'Product Code': report_df['product_id'],
+        'Barcode': report_df['gtin'].fillna(''),
+        'Brand': report_df['brand'].fillna(''),
+        'Category': report_df['category'].fillna(''),
+        'Product Tags': '-',
+        'Number of Matches': report_df['comp_count'],
+        'My Index': report_df['my_index'],
+        'My Position': report_df['my_position'],
+        'Cheapest Site': report_df['cheapest_site'],
+        'Highest Site': report_df['highest_site'],
+        'Minimum Price': report_df['min_price'],
+        'Maximum Price': report_df['max_price'],
+        'Average Price': report_df['avg_price'],
+        'My Price': report_df['my_price'],
+        'My Product Cost': report_df['my_product_cost'],
+        'Additional Cost': 0,
+        'SmartPrice': '-',
+        'Last Update Cycle': report_df['last_update_cycle'],
+        'Site': report_df['site_display'],
+        'Site Index': '-',
+        'Price': report_df['s_price'].fillna(0.00),
+        'Change direction': '-',
+        'Stock': report_df['s_stock'],
+        'URL': report_df['s_url'].fillna(report_df['osb_url']).fillna('')
+    }
     
     cols1 = [
         'Product Name', 'Product Code', 'Barcode', 'Brand', 'Category',
@@ -510,35 +494,16 @@ def main():
         'SmartPrice', 'Last Update Cycle', 'Site', 'Site Index', 'Price',
         'Change direction', 'Stock', 'URL'
     ]
-    df1 = df1[cols1]
+    df1 = pd.DataFrame(df1_data, columns=cols1)
     
-    df2 = pd.DataFrame()
-    df2['Product Name'] = df1['Product Name']
-    df2['Product Code'] = df1['Product Code']
-    df2['Barcode'] = df1['Barcode']
-    df2['Brand'] = df1['Brand']
-    df2['Category'] = df1['Category']
-    df2['Product Tags'] = '-'
-    df2['Number of Matches'] = df1['Number of Matches']
-    df2['My Index'] = df1['My Index']
-    df2['My Position'] = df1['My Position']
-    df2['Cheapest Site'] = df1['Cheapest Site']
-    df2['Highest Site'] = df1['Highest Site']
+    # Efficiently reuse df1 to build df2 instead of allocating a new 10M row DataFrame from scratch
+    df2 = df1.copy()
+    df2 = df2.drop(columns=['Minimum Price', 'Maximum Price', 'Average Price', 'Price'])
     df2['Minimum Price (Total Price)'] = '-'
     df2['Maximum Price (Total Price)'] = '-'
     df2['Average Price (Total Price)'] = '-'
-    df2['My Price'] = df1['My Price']
     df2['My Total Price'] = '-'
-    df2['My Product Cost'] = df1['My Product Cost']
-    df2['Additional Cost'] = 0
-    df2['SmartPrice'] = '-'
-    df2['Last Update Cycle'] = df1['Last Update Cycle']
-    df2['Site'] = df1['Site']
-    df2['Site Index'] = '-'
     df2['Total Price'] = df1['Price']
-    df2['Change direction'] = '-'
-    df2['Stock'] = df1['Stock']
-    df2['URL'] = df1['URL']
     
     cols2 = [
         'Product Name', 'Product Code', 'Barcode', 'Brand', 'Category',
@@ -551,7 +516,6 @@ def main():
     ]
     df2 = df2[cols2]
 
-
     # Generate file names
     now = datetime.now()
     date_prefix = now.strftime("%Y.%m.%d-%H%M")
@@ -560,30 +524,25 @@ def main():
     file1_name = f"{date_prefix}_1stopbedrooms_Prisync_Vertical_Report_price_change_stock_{ts_ms}.csv"
     file2_name = f"{date_prefix}_1stopbedrooms_Prisync_Vertical_Report_total_price_change_stock_{ts_ms + 1}.csv"
 
-    file1_path = os.path.join(os.getcwd(), file1_name)
-    file2_path = os.path.join(os.getcwd(), file2_name)
-
-    print(f"Saving File 1: {file1_name}")
-    df1.to_csv(file1_path, index=False)
-
-    print(f"Saving File 2: {file2_name}")
-    df2.to_csv(file2_path, index=False)
-
-    # Zip the files
+    # Zip the files directly using stream buffers (prevents writing giant intermediate CSVs to disk)
     zip_filename = "1stopbedrooms_export.zip"
     zip_path = os.path.join(os.getcwd(), zip_filename)
-    print(f"Creating ZIP archive {zip_filename}...")
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        zipf.write(file1_path, arcname=file1_name)
-        zipf.write(file2_path, arcname=file2_name)
-    print(f"✓ ZIP archive created at: {zip_path}")
-
-    # Clean up local CSVs
+    
+    print(f"Streaming CSVs directly into ZIP archive {zip_filename}...")
     try:
-        os.remove(file1_path)
-        os.remove(file2_path)
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            print(f"Compressing File 1 into ZIP...")
+            with zipf.open(file1_name, 'w') as f1:
+                df1.to_csv(f1, index=False, line_terminator='\n')
+                
+            print(f"Compressing File 2 into ZIP...")
+            with zipf.open(file2_name, 'w') as f2:
+                df2.to_csv(f2, index=False, line_terminator='\n')
+                
+        print(f"✓ ZIP archive successfully completed at: {zip_path}")
     except Exception as e:
-        print(f"Warning: Failed to clean up CSV files: {e}")
+        print(f"❌ Failed to build ZIP archive: {e}")
+        sys.exit(1)
 
     # SFTP upload to Oracle server
     oracle_success = upload_to_oracle_sftp(zip_path, zip_filename)

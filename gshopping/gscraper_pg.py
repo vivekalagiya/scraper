@@ -295,6 +295,29 @@ def insert_to_postgres(product_results, seller_results):
                 return {"raw_value": val}
         return val
 
+    def _clean_numeric(val):
+        if val is None or val == '':
+            return None
+        try:
+            match = re.search(r'[-+]?\d*\.?\d+', str(val))
+            if match:
+                return float(match.group(0))
+            return None
+        except:
+            return None
+
+    def _clean_boolean(val):
+        if val is None or val == '':
+            return None
+        if isinstance(val, bool):
+            return val
+        s = str(val).strip().lower()
+        if s in ('true', 'yes', 'y', '1', 'required'):
+            return True
+        if s in ('false', 'no', 'n', '0', 'not required', 'none'):
+            return False
+        return None
+
     pg_host = os.environ.get("PG_HOST")
     pg_port = os.environ.get("PG_PORT", "5432")
     pg_user = os.environ.get("PG_USER")
@@ -330,7 +353,7 @@ def insert_to_postgres(product_results, seller_results):
             prod_ids = sorted({str(r.get("product_id", "")).strip() for r in product_results if r.get("product_id")})
             if prod_ids:
                 # Delete existing sellers for these products to prevent duplicate or stale entries
-                cursor.execute("DELETE FROM google_shopping_sellers WHERE product_id = ANY(%s)", (prod_ids,))
+                cursor.execute("DELETE FROM google_shopping_sellers WHERE product_id = ANY(%s::integer[])", (prod_ids,))
 
         # 1. Upsert google_shopping_results (1-to-1 relationship)
         if valid_product_results:
@@ -423,14 +446,14 @@ def insert_to_postgres(product_results, seller_results):
                     psycopg2.extras.Json(gs_images_val),
                     r.get("brand"),
                     r.get("color"),
-                    r.get("width"),
-                    r.get("height"),
-                    r.get("depth"),
+                    _clean_numeric(r.get("width")),
+                    _clean_numeric(r.get("height")),
+                    _clean_numeric(r.get("depth")),
                     r.get("style"),
                     r.get("material"),
                     r.get("shape"),
-                    r.get("assembly_required"),
-                    r.get("weight"),
+                    _clean_boolean(r.get("assembly_required")),
+                    _clean_numeric(r.get("weight")),
                     rating_star_val,
                     rating_count_val,
                     typical_price_low_val,
@@ -657,7 +680,7 @@ def insert_to_postgres(product_results, seller_results):
                             claimed_by = NULL,
                             claimed_at = NULL
                         FROM (VALUES %s) AS v(product_id, scraping_status, error_message)
-                        WHERE p.product_id = v.product_id
+                        WHERE p.product_id = v.product_id::bigint
                     """
                 else:
                     status_update_query = """
@@ -666,7 +689,7 @@ def insert_to_postgres(product_results, seller_results):
                             last_attempt = CURRENT_TIMESTAMP,
                             error_message = v.error_message
                         FROM (VALUES %s) AS v(product_id, scraping_status, error_message)
-                        WHERE p.product_id = v.product_id
+                        WHERE p.product_id = v.product_id::bigint
                     """
                 execute_values(cursor, status_update_query, status_values, page_size=db_page_size)
 
@@ -1124,7 +1147,7 @@ def claim_specific_products_from_db(product_ids, worker_id=None, limit=30, ttl_m
             WITH picked AS (
                 SELECT product_id
                 FROM osb_products
-                WHERE product_id = ANY(%s)
+                WHERE product_id = ANY(%s::bigint[])
                   AND scraping_status = %s 
                   AND status = 1
                 ORDER BY mfr_sales_30d DESC NULLS LAST, product_id ASC
