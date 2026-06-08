@@ -318,6 +318,27 @@ def insert_to_postgres(product_results, seller_results):
             return False
         return None
 
+    def _clean_int(val):
+        if val is None or pd.isna(val):
+            return None
+        try:
+            val_str = str(val).strip()
+            if not val_str:
+                return None
+            if '.' in val_str:
+                return int(float(val_str))
+            return int(val_str)
+        except (ValueError, TypeError):
+            return None
+
+    def _clean_str(val, max_len=None, default=''):
+        if val is None or pd.isna(val):
+            return default
+        s = str(val).strip()
+        if max_len is not None and len(s) > max_len:
+            return s[:max_len]
+        return s
+
     pg_host = os.environ.get("PG_HOST")
     pg_port = os.environ.get("PG_PORT", "5432")
     pg_user = os.environ.get("PG_USER")
@@ -350,7 +371,22 @@ def insert_to_postgres(product_results, seller_results):
 
         # Gather all product_ids to clean up pre-existing competitor/seller records
         if product_results:
-            prod_ids = sorted({str(r.get("product_id", "")).strip() for r in product_results if r.get("product_id")})
+            parsed_prod_ids = []
+            for r in product_results:
+                pid = r.get("product_id")
+                if pid:
+                    try:
+                        if isinstance(pid, str):
+                            pid_str = pid.strip()
+                            if '.' in pid_str:
+                                pid = float(pid_str)
+                            else:
+                                pid = int(pid_str)
+                        if isinstance(pid, (int, float)):
+                            parsed_prod_ids.append(int(pid))
+                    except (ValueError, TypeError):
+                        pass
+            prod_ids = sorted(list(set(parsed_prod_ids)))
             if prod_ids:
                 # Delete existing sellers for these products to prevent duplicate or stale entries
                 cursor.execute("DELETE FROM google_shopping_sellers WHERE product_id = ANY(%s::integer[])", (prod_ids,))
@@ -439,40 +475,40 @@ def insert_to_postgres(product_results, seller_results):
                         typical_price_high_val = None
 
                 prod_values.append((
-                    str(r.get("product_id", "")),
-                    str(r.get("google_title", r.get("product_name", ""))),
-                    str(r.get("google_description", r.get("description", ""))),
-                    str(r.get("gs_main_image", r.get("main_image", ""))),
-                    psycopg2.extras.Json(gs_images_val),
-                    r.get("brand"),
-                    r.get("color"),
-                    _clean_numeric(r.get("width")),
-                    _clean_numeric(r.get("height")),
-                    _clean_numeric(r.get("depth")),
-                    r.get("style"),
-                    r.get("material"),
-                    r.get("shape"),
-                    _clean_boolean(r.get("assembly_required")),
-                    _clean_numeric(r.get("weight")),
-                    rating_star_val,
-                    rating_count_val,
-                    typical_price_low_val,
-                    typical_price_high_val,
-                    str(r.get("best_price_url", "")),
-                    str(r.get("popular_url", "")),
-                    psycopg2.extras.Json(parse_jsonb_field(r.get("attributes"))),
-                    str(r.get("last_response", "")),
-                    str(r.get("osb_url_match", "")),
-                    str(r.get("product_url", "")),
-                    str(r.get("cid", "")),
-                    str(r.get("pid", "")),
-                    int(r.get("osb_position", 0) or 0),
-                    str(r.get("osb_id", "")),
-                    int(r.get("seller_count", 0) or 0),
-                    str(r.get("status", "")),
-                    datetime.now(),
-                    datetime.now()
-                ))
+                     _clean_int(r.get("product_id")),
+                     _clean_str(r.get("google_title", r.get("product_name")), 512),
+                     _clean_str(r.get("google_description", r.get("description")), default=''),
+                     _clean_str(r.get("gs_main_image", r.get("main_image")), 1024),
+                     psycopg2.extras.Json(gs_images_val),
+                     _clean_str(r.get("brand"), 128, default=None),
+                     _clean_str(r.get("color"), default=None),
+                     _clean_numeric(r.get("width")),
+                     _clean_numeric(r.get("height")),
+                     _clean_numeric(r.get("depth")),
+                     _clean_str(r.get("style"), 256, default=None),
+                     _clean_str(r.get("material"), 256, default=None),
+                     _clean_str(r.get("shape"), 128, default=None),
+                     _clean_boolean(r.get("assembly_required")),
+                     _clean_numeric(r.get("weight")),
+                     rating_star_val,
+                     rating_count_val,
+                     typical_price_low_val,
+                     typical_price_high_val,
+                     _clean_str(r.get("best_price_url"), 1024),
+                     _clean_str(r.get("popular_url"), 1024),
+                     psycopg2.extras.Json(parse_jsonb_field(r.get("attributes"))),
+                     _clean_str(r.get("last_response"), default=''),
+                     _clean_str(r.get("osb_url_match"), 1024),
+                     _clean_str(r.get("product_url"), 2048),
+                     _clean_str(r.get("cid"), 64),
+                     _clean_str(r.get("pid"), 64),
+                     int(r.get("osb_position", 0) or 0),
+                     _clean_str(r.get("osb_id"), 256),
+                     int(r.get("seller_count", 0) or 0),
+                     _clean_str(r.get("status"), 32),
+                     datetime.now(),
+                     datetime.now()
+                 ))
             execute_values(cursor, prod_insert, prod_values, page_size=db_page_size)
 
         # 2. Upsert google_shopping_sellers (1-to-many relationship)
@@ -486,9 +522,10 @@ def insert_to_postgres(product_results, seller_results):
             # Upsert into competitors first to get their IDs and base URLs
             competitor_data = {}
             for r in valid_seller_results:
-                s_name = str(r.get("seller", r.get("seller_name", ""))).strip()
-                if not s_name:
+                raw_name = str(r.get("seller", r.get("seller_name", ""))).strip()
+                if not raw_name:
                     continue
+                s_name = raw_name[:128]
                 s_url = str(r.get("seller_url", "")).strip()
                 base_url = ""
                 if s_url:
@@ -573,18 +610,18 @@ def insert_to_postgres(product_results, seller_results):
             seller_values = []
             seen_sellers = set()
             for r in valid_seller_results:
-                p_code = str(r.get("product_id", r.get("product_code", ""))).strip()
-                s_name = str(r.get("seller", r.get("seller_name", ""))).strip()
+                p_code = _clean_int(r.get("product_id", r.get("product_code")))
+                s_name = _clean_str(r.get("seller", r.get("seller_name")), 128)
                 price = parse_price(r.get("seller_price"))
                 
-                if not p_code or not s_name:
+                if p_code is None or not s_name:
                     continue
                 
                 comp_id = competitor_map.get(s_name)
                 if not comp_id:
                     continue
                 
-                seller_url = str(r.get("seller_url") or "").strip()
+                seller_url = _clean_str(r.get("seller_url"), 2048)
                 
                 import hashlib
                 url_hash = hashlib.md5(seller_url.encode('utf-8', errors='ignore')).hexdigest()
@@ -630,19 +667,19 @@ def insert_to_postgres(product_results, seller_results):
                 seller_values.append((
                     p_code,
                     comp_id,
-                    s_name,
-                    r.get("seller_product_name", ""),
+                    _clean_str(s_name, 256),
+                    _clean_str(r.get("seller_product_name"), 512),
                     seller_url,
                     price,
                     orig_price,
                     disc_amount,
-                    r.get("coupon_code", ""),
-                    r.get("coupon_remark", ""),
-                    r.get("stock_status", "In Stock"),
+                    _clean_str(r.get("coupon_code"), 64),
+                    _clean_str(r.get("coupon_remark"), 256),
+                    _clean_str(r.get("stock_status"), 32, default="In Stock"),
                     sel_rating,
-                    r.get("delivery_tagline", ""),
+                    _clean_str(r.get("delivery_tagline"), 256),
                     google_pos,
-                    display,
+                    _clean_str(display, 256),
                     is_me_flag
                 ))
 
@@ -653,12 +690,12 @@ def insert_to_postgres(product_results, seller_results):
         if product_results:
             status_values = []
             for r in product_results:
-                p_id = str(r.get("product_id", "")).strip()
-                if not p_id:
+                p_id = _clean_int(r.get("product_id"))
+                if p_id is None:
                     continue
                 status_lower = str(r.get("status", "")).strip().lower()
                 
-                if p_id in retry_product_ids:
+                if str(p_id) in retry_product_ids or p_id in retry_product_ids:
                     scr_status = 'pending'
                     err_msg = 'Invalid product URL, retrying'
                 elif status_lower == 'completed' or status_lower == 'product_found':
@@ -666,7 +703,8 @@ def insert_to_postgres(product_results, seller_results):
                     err_msg = None
                 else:
                     scr_status = 'error'
-                    err_msg = r.get('last_response') or f"Scrape ended with status: {status_lower}"
+                    raw_err = r.get('last_response') or f"Scrape ended with status: {status_lower}"
+                    err_msg = _clean_str(raw_err, 1024, default=None)
                 
                 status_values.append((p_id, scr_status, err_msg))
 
@@ -802,6 +840,27 @@ def sync_csv_to_db(csv_path):
             records = batch.to_dict('records')
             values = []
             
+            def _clean_int(val):
+                if val is None or pd.isna(val):
+                    return None
+                try:
+                    val_str = str(val).strip()
+                    if not val_str:
+                        return None
+                    if '.' in val_str:
+                        return int(float(val_str))
+                    return int(val_str)
+                except (ValueError, TypeError):
+                    return None
+
+            def clean_str(val, max_len=None):
+                if val is None or pd.isna(val):
+                    return ''
+                s = str(val).strip()
+                if max_len is not None and len(s) > max_len:
+                    return s[:max_len]
+                return s
+
             for row_dict in records:
                 sales = row_dict.get('30daymfrsales', 0)
                 if pd.isna(sales) or sales == '': sales = 0
@@ -809,21 +868,18 @@ def sync_csv_to_db(csv_path):
                 p_status = row_dict.get('status', 1)
                 if pd.isna(p_status) or p_status == '': p_status = 1
 
-                def clean(val):
-                    return '' if pd.isna(val) else str(val)
-
                 values.append((
-                    clean(row_dict.get('product_id')),
-                    clean(row_dict.get('web_id')),
-                    clean(row_dict.get('name')),
-                    clean(row_dict.get('mpn_sku')),  # sku
-                    clean(row_dict.get('mpn_sku')),  # mpn
-                    clean(row_dict.get('gtin')),
-                    clean(row_dict.get('brand')),
-                    clean(row_dict.get('category')), # product_type
-                    clean(row_dict.get('keyword')),
-                    clean(row_dict.get('url')),
-                    clean(row_dict.get('osb_url')),
+                    _clean_int(row_dict.get('product_id')),
+                    clean_str(row_dict.get('web_id'), 32),
+                    clean_str(row_dict.get('name')),
+                    clean_str(row_dict.get('mpn_sku'), 128),  # sku
+                    clean_str(row_dict.get('mpn_sku'), 128),  # mpn
+                    _clean_int(row_dict.get('gtin')),
+                    clean_str(row_dict.get('brand'), 128),
+                    clean_str(row_dict.get('category'), 128), # product_type
+                    clean_str(row_dict.get('keyword'), 2048),
+                    clean_str(row_dict.get('url'), 2048),
+                    clean_str(row_dict.get('osb_url'), 1024),
                     int(p_status),
                     int(sales)
                 ))
@@ -1111,6 +1167,28 @@ def claim_specific_products_from_db(product_ids, worker_id=None, limit=30, ttl_m
     if not product_ids:
         return pd.DataFrame()
         
+    # Convert product_ids to integers since product_id is an integer/bigint column in the database
+    parsed_ids = []
+    for pid in product_ids:
+        if pid is None:
+            continue
+        try:
+            if isinstance(pid, str):
+                pid_str = pid.strip()
+                if not pid_str:
+                    continue
+                if '.' in pid_str:
+                    pid = float(pid_str)
+                else:
+                    pid = int(pid_str)
+            if isinstance(pid, (int, float)):
+                parsed_ids.append(int(pid))
+        except (ValueError, TypeError):
+            pass
+            
+    if not parsed_ids:
+        return pd.DataFrame()
+        
     conn = None
     cursor = None
     try:
@@ -1164,7 +1242,7 @@ def claim_specific_products_from_db(product_ids, worker_id=None, limit=30, ttl_m
             WHERE p.product_id = picked.product_id
             RETURNING p.product_id, p.web_id, p.name, p.sku AS mpn_sku, p.gtin, p.brand, p.product_type AS category, p.keyword, p.url, p.osb_url, p.status, p.mfr_sales_30d AS "30daymfrsales", p.scraping_status, p.claimed_by, p.claimed_at, p.last_attempt, p.error_message, p.created_at, p.updated_at, p.color, p.bed_size_measure, p.mattress_size
             """,
-            (product_ids, PENDING_STATUS, int(limit), CLAIM_STATUS, worker_id),
+            (parsed_ids, PENDING_STATUS, int(limit), CLAIM_STATUS, worker_id),
         )
         rows = cursor.fetchall()
         cols = [d[0] for d in cursor.description] if cursor.description else []
@@ -1212,14 +1290,14 @@ def get_pending_chunk_from_db(limit, offset):
             except Exception:
                 pass
 
-def verify_and_claim_product(product_id, worker_id=None, ttl_minutes=60):
+def verify_and_claim_product(product_id, worker_id=None, ttl_minutes=60, conn=None):
     """
     Verify that a product is still available or claimed by us, and atomically claim/renew it.
     Returns True if we successfully claimed/renewed it and can scrape it.
     Returns False if it is completed, failed, or claimed by someone else.
     """
-    conn = None
     cursor = None
+    close_conn = False
     try:
         pg_host = os.environ.get("PG_HOST")
         pg_port = os.environ.get("PG_PORT", "5432")
@@ -1232,7 +1310,9 @@ def verify_and_claim_product(product_id, worker_id=None, ttl_minutes=60):
             return True
 
         worker_id = _get_worker_id(worker_id)
-        conn = psycopg2.connect(host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db)
+        if conn is None:
+            conn = psycopg2.connect(host=pg_host, port=pg_port, user=pg_user, password=pg_pass, dbname=pg_db)
+            close_conn = True
         cursor = conn.cursor()
 
         if not _supports_claim_columns(cursor):
@@ -1280,6 +1360,11 @@ def verify_and_claim_product(product_id, worker_id=None, ttl_minutes=60):
         return claimed
     except Exception as e:
         print(f"Error verifying/claiming product {product_id} in DB: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         return False
     finally:
         if cursor:
@@ -1287,7 +1372,7 @@ def verify_and_claim_product(product_id, worker_id=None, ttl_minutes=60):
                 cursor.close()
             except Exception:
                 pass
-        if conn:
+        if conn and close_conn:
             try:
                 conn.close()
             except Exception:
@@ -1336,8 +1421,27 @@ def update_product_status(product_id, scraping_status, error_message=None):
 
 def release_claimed_products(product_ids, worker_id=None, reason="not_processed"):
     """Return unprocessed rows claimed by this worker to the pending queue."""
-    product_ids = [str(pid).strip() for pid in product_ids if str(pid).strip()]
-    if not product_ids:
+    # Convert product_ids to integers since product_id is an integer/bigint column in the database.
+    # We handle potential float strings (e.g. "106766.0") and safely ignore non-numeric IDs.
+    parsed_ids = []
+    for pid in product_ids:
+        if pid is None:
+            continue
+        try:
+            if isinstance(pid, str):
+                pid_str = pid.strip()
+                if not pid_str:
+                    continue
+                if '.' in pid_str:
+                    pid = float(pid_str)
+                else:
+                    pid = int(pid_str)
+            if isinstance(pid, (int, float)):
+                parsed_ids.append(int(pid))
+        except (ValueError, TypeError):
+            pass
+
+    if not parsed_ids:
         return 0
 
     conn = None
@@ -1353,11 +1457,11 @@ def release_claimed_products(product_ids, worker_id=None, reason="not_processed"
                 claimed_by = NULL,
                 claimed_at = NULL,
                 error_message = %s
-            WHERE product_id = ANY(%s)
+            WHERE product_id = ANY(%s::bigint[])
               AND scraping_status = %s
               AND claimed_by = %s
             """,
-            (PENDING_STATUS, reason, product_ids, CLAIM_STATUS, resolved_worker_id),
+            (PENDING_STATUS, reason, parsed_ids, CLAIM_STATUS, resolved_worker_id),
         )
         released = cursor.rowcount
         conn.commit()
@@ -3620,6 +3724,7 @@ def process_chunk(df, chunk_id, total_chunks, round_id=1, output_dir='output', w
         def worker_thread():
             thread_id = threading.get_ident()
             driver = None
+            conn = None
             try:
                 driver = setup_driver(max_attempts=3, base_delay=5)
             except Exception as e:
@@ -3674,8 +3779,17 @@ def process_chunk(df, chunk_id, total_chunks, round_id=1, output_dir='output', w
                     print(f"\n[Thread {thread_id}] Processing {index+1}/{len(df)}: Product ID {product_id}")
                     
                     # Check database status and claim the product atomically before scraping
-                    if not verify_and_claim_product(product_id, resolved_worker_id, ttl_minutes):
+                    try:
+                        if conn is None or conn.closed:
+                            conn = _get_pg_conn()
+                    except Exception as db_err:
+                        print(f"[Thread {thread_id}] Database connection failed: {db_err}")
+                        time.sleep(5)
+
+                    if not verify_and_claim_product(product_id, resolved_worker_id, ttl_minutes, conn=conn):
                         print(f"[Thread {thread_id}] Skipping product {product_id} - already claimed/completed by another worker.")
+                        if conn and conn.closed:
+                            conn = None
                         continue
                     
                     try:
@@ -3738,6 +3852,11 @@ def process_chunk(df, chunk_id, total_chunks, round_id=1, output_dir='output', w
                 try:
                     if driver:
                         driver.quit()
+                except Exception:
+                    pass
+                try:
+                    if conn:
+                        conn.close()
                 except Exception:
                     pass
 
