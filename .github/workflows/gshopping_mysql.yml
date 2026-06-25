@@ -70,7 +70,7 @@ permissions:
 
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
@@ -213,7 +213,7 @@ jobs:
   dispatch_next_round:
     needs: scrape
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
 
