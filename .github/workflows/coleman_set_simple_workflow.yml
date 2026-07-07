@@ -1,0 +1,211 @@
+name: Coleman Set-Simple Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_urls_per_brand:
+        description: "Limit URLs per brand (0 = all)"
+        required: true
+        default: "0"
+        type: string
+      urls_per_job:
+        description: "How many URLs each parallel job processes"
+        required: true
+        default: "100"
+        type: string
+      max_parallel_jobs:
+        description: "Max parallel jobs (GitHub Actions limit safety)"
+        required: true
+        default: "20"
+        type: string
+      flush_every:
+        description: "Flush progress every N output rows"
+        required: true
+        default: "25"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    env:
+      ZYTE_API_KEY: ${{ secrets.ZYTE_API_KEY }}
+      COLEMAN_ZYTE_ONLY: "1"
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r coleman_set_simple/requirements.txt
+
+      - name: Collect brand product URLs
+        run: |
+          python coleman_set_simple/scrape_coleman_product_urls.py \
+            --out coleman_product_urls.csv \
+            --max-urls "${{ inputs.max_urls_per_brand }}"
+
+      - name: Chunk URL file + build matrix
+        id: matrix
+        run: |
+          python - <<'PY'
+          import csv, json, os, math
+          in_path = "coleman_product_urls.csv"
+          urls_per_job = int(os.environ.get("URLS_PER_JOB", "${{ inputs.urls_per_job }}") or "100")
+          max_jobs = int(os.environ.get("MAX_JOBS", "${{ inputs.max_parallel_jobs }}") or "20")
+          rows = []
+          with open(in_path, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+              if row.get("product_url"):
+                rows.append(row)
+          total = len(rows)
+          if total == 0:
+            print("No URLs found.")
+            print("matrix=[]")
+            with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write("matrix=[]\n")
+            raise SystemExit(0)
+          chunk = max(1, urls_per_job)
+          jobs = math.ceil(total / chunk)
+          if jobs > max_jobs:
+            chunk = math.ceil(total / max_jobs)
+            jobs = math.ceil(total / chunk)
+          os.makedirs("chunks", exist_ok=True)
+          header = ["brand", "product_url"]
+          matrix = []
+          for i in range(jobs):
+            part = rows[i*chunk:(i+1)*chunk]
+            p = f"chunks/urls_{i}.csv"
+            with open(p, "w", newline="", encoding="utf-8") as out:
+              w = csv.DictWriter(out, fieldnames=header)
+              w.writeheader()
+              w.writerows(part)
+            matrix.append({"job_index": i, "chunk_file": p})
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+            out.write(f"matrix={json.dumps(matrix)}\n")
+          print(f"Total URLs: {total} | jobs: {jobs} | chunk_size: {chunk}")
+          PY
+
+      - name: Upload URL chunks
+        uses: actions/upload-artifact@v4
+        with:
+          name: coleman_set_simple_chunks
+          path: chunks/urls_*.csv
+          retention-days: 2
+
+      - name: Upload URL list
+        uses: actions/upload-artifact@v4
+        with:
+          name: coleman_product_urls
+          path: coleman_product_urls.csv
+          retention-days: 7
+
+  scrape:
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      ZYTE_API_KEY: ${{ secrets.ZYTE_API_KEY }}
+      COLEMAN_ZYTE_ONLY: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r coleman_set_simple/requirements.txt
+
+      - name: Download chunks
+        uses: actions/download-artifact@v4
+        with:
+          name: coleman_set_simple_chunks
+          path: chunks
+
+      - name: Run bundle extraction for chunk
+        run: |
+          JOB="${{ matrix.job_index }}"
+          IN="${{ matrix.chunk_file }}"
+          python coleman_set_simple/collect_set_simple_from_urls.py \
+            --urls "$IN" \
+            --out "coleman_set_simple_part_${JOB}.csv" \
+            --flush-every "${{ inputs.flush_every }}"
+
+      - name: Upload part
+        uses: actions/upload-artifact@v4
+        with:
+          name: coleman_set_simple_part_${{ matrix.job_index }}
+          path: coleman_set_simple_part_${{ matrix.job_index }}.csv
+          retention-days: 7
+
+  merge:
+    needs: [plan, scrape]
+    if: always() && needs.plan.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download parts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coleman_set_simple_part_*
+          path: parts
+          merge-multiple: true
+
+      - name: Merge parts
+        run: |
+          python - <<'PY'
+          import glob, csv
+          files = sorted(glob.glob("parts/*.csv"))
+          if not files:
+            raise SystemExit("No part files found")
+          out = "coleman_set_simple.csv"
+          seen = set()
+          header = None
+          with open(out, "w", newline="", encoding="utf-8") as fo:
+            w = None
+            for f in files:
+              with open(f, "r", encoding="utf-8") as fi:
+                r = csv.reader(fi)
+                h = next(r, None)
+                if not h:
+                  continue
+                if header is None:
+                  header = h
+                  w = csv.writer(fo)
+                  w.writerow(header)
+                for row in r:
+                  if not row:
+                    continue
+                  key = tuple(row)
+                  if key in seen:
+                    continue
+                  seen.add(key)
+                  w.writerow(row)
+          print("merged_rows", len(seen))
+          PY
+
+      - name: Upload merged output
+        uses: actions/upload-artifact@v4
+        with:
+          name: coleman_set_simple_outputs
+          path: |
+            coleman_set_simple.csv
+          retention-days: 7
+
