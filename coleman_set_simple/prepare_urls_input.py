@@ -67,8 +67,26 @@ def _from_xlsx(path: str) -> List[Tuple[str, str]]:
     for sheet in wb.sheetnames:
         brand = _norm_brand(sheet)
         ws = wb[sheet]
-        for row in ws.iter_rows(values_only=True):
-            for cell in row:
+
+        # Prefer header-based URL columns to avoid accidentally scanning other cells.
+        header = []
+        max_col = min(100, ws.max_column or 0)
+        for c in range(1, max_col + 1):
+            v = ws.cell(1, c).value
+            header.append((c, (str(v).strip() if v is not None else "")))
+        url_cols = [c for c, h in header if ("url" in h.lower() or "link" in h.lower())]
+        if not url_cols:
+            # Fallback: old behavior (scan all cells)
+            url_cols = list(range(1, max_col + 1))
+
+        for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            # skip header row
+            if r_idx == 1:
+                continue
+            for c in url_cols:
+                if c - 1 >= len(row):
+                    continue
+                cell = row[c - 1]
                 for u in _extract_urls_from_cell(cell):
                     if not _looks_like_coleman_product(u):
                         continue
