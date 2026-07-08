@@ -38,6 +38,7 @@ class BundleItem:
     item_sku: str
     item_name: str
     item_image_url: str
+    item_is_required: str  # "true"/"false" for CSV friendliness
 
 
 def _abs_url(href: str, base: str) -> Optional[str]:
@@ -53,10 +54,44 @@ def _clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
+def _url_from_srcset(srcset: str, base: str) -> str:
+    s = (srcset or "").strip()
+    if not s:
+        return ""
+    first = s.split(",")[0].strip()
+    if not first:
+        return ""
+    url_part = first.split()[0].strip()
+    if not url_part or url_part.startswith("data:"):
+        return ""
+    u = _abs_url(url_part, base)
+    return u or ""
+
+
 def _best_img_url(img_tag, base: str) -> str:
     if not img_tag:
         return ""
-    for key in ("data-src", "data-original", "data-lazy", "data-amsrc", "src"):
+
+    # srcset variants (common on <source> and lazy-loaded <img>)
+    for key in ("data-srcset", "data-lazy-srcset", "data-src-set", "srcset"):
+        v = (img_tag.get(key) or "").strip()
+        u = _url_from_srcset(v, base)
+        if u:
+            return u
+
+    # direct URL variants
+    for key in (
+        "data-src",
+        "data-original",
+        "data-lazy",
+        "data-amsrc",
+        "data-thumb",
+        "data-image",
+        "data-bg",
+        "data-background",
+        "data-background-image",
+        "src",
+    ):
         v = (img_tag.get(key) or "").strip()
         if not v or v.startswith("data:"):
             continue
@@ -76,15 +111,16 @@ def _best_bg_image_url(container, base: str) -> str:
         pass
     for n in nodes:
         style = (getattr(n, "get", lambda *_: "")("style") or "").strip()
-        if "background-image" not in style.lower():
+        s_lower = style.lower()
+        if "background" not in s_lower or "url(" not in s_lower:
             continue
-        m = re.search(r"background-image\s*:\s*url\(([^)]+)\)", style, flags=re.IGNORECASE)
-        if not m:
-            continue
-        raw = m.group(1).strip().strip("\"' ")
-        u = _abs_url(raw, base)
-        if u:
-            return u
+        # Be permissive: background-image:url(...), background:url(...), multiple urls, etc.
+        m = re.search(r"url\(([^)]+)\)", style, flags=re.IGNORECASE)
+        if m:
+            raw = m.group(1).strip().strip("\"' ")
+            u = _abs_url(raw, base)
+            if u:
+                return u
     return ""
 
 
@@ -192,6 +228,13 @@ def parse_bundle_items(html: str, main_url: str) -> List[BundleItem]:
         item_sku = _extract_sku_from_container(chosen, container_html)
         item_name = _extract_name_from_anchor_or_container(a, chosen)
         item_img = _best_image_from_container(chosen or a, main_url)
+        is_required = False
+        try:
+            req = (chosen or a).select_one("div.required-warning")
+            if req and "required" in (req.get_text(" ", strip=True) or "").lower():
+                is_required = True
+        except Exception:
+            pass
 
         items.append(
             BundleItem(
@@ -202,6 +245,7 @@ def parse_bundle_items(html: str, main_url: str) -> List[BundleItem]:
                 item_sku=item_sku,
                 item_name=item_name,
                 item_image_url=item_img,
+                item_is_required="true" if is_required else "false",
             )
         )
 
@@ -225,6 +269,7 @@ def write_csv(items: Sequence[BundleItem], out_path: str) -> None:
                 "item_sku",
                 "item_name",
                 "item_image_url",
+                "item_is_required",
             ],
         )
         w.writeheader()
@@ -238,6 +283,7 @@ def write_csv(items: Sequence[BundleItem], out_path: str) -> None:
                     "item_sku": it.item_sku,
                     "item_name": it.item_name,
                     "item_image_url": it.item_image_url,
+                    "item_is_required": it.item_is_required,
                 }
             )
 

@@ -30,12 +30,13 @@ OUT_FIELDS = [
     "item_sku",
     "item_name",
     "item_image_url",
+    "item_is_required",
 ]
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--urls", required=True, help="Input CSV with columns: brand, product_url")
+    ap.add_argument("--urls", required=True, help="Input CSV with URL column (product_url/url) and optional brand")
     ap.add_argument("--out", default=os.path.join(os.getcwd(), "coleman_set_simple.csv"))
     ap.add_argument("--zyte-api-key", default="", help="Zyte API key (or set env var ZYTE_API_KEY)")
     ap.add_argument("--flush-every", type=int, default=25, help="Flush progress every N written rows")
@@ -61,7 +62,7 @@ def main() -> int:
             r = csv.DictReader(in_f)
             for row in r:
                 brand = (row.get("brand") or "").strip()
-                url = (row.get("product_url") or "").strip()
+                url = (row.get("product_url") or row.get("url") or row.get("link") or "").strip()
                 if not url:
                     continue
 
@@ -90,6 +91,7 @@ def main() -> int:
                         "item_sku": it.item_sku,
                         "item_name": it.item_name,
                         "item_image_url": it.item_image_url,
+                        "item_is_required": getattr(it, "item_is_required", ""),
                     }
                     w.writerow(out)
                     wrote += 1

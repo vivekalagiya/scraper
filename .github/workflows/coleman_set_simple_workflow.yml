@@ -3,6 +3,11 @@ name: Coleman Set-Simple Workflow
 on:
   workflow_dispatch:
     inputs:
+      urls_file:
+        description: "Optional repo path to .xlsx/.csv of URLs (skips brand URL scrape). Example: data/coleman_urls.xlsx"
+        required: false
+        default: ""
+        type: string
       max_urls_per_brand:
         description: "Limit URLs per brand (0 = all)"
         required: true
@@ -49,10 +54,18 @@ jobs:
           pip install -r coleman_set_simple/requirements.txt
 
       - name: Collect brand product URLs
+        if: inputs.urls_file == ''
         run: |
           python coleman_set_simple/scrape_coleman_product_urls.py \
             --out coleman_product_urls.csv \
             --max-urls "${{ inputs.max_urls_per_brand }}"
+
+      - name: Prepare URL list from provided file
+        if: inputs.urls_file != ''
+        run: |
+          python coleman_set_simple/prepare_urls_input.py \
+            --in "${{ inputs.urls_file }}" \
+            --out coleman_product_urls.csv
 
       - name: Chunk URL file + build matrix
         id: matrix
