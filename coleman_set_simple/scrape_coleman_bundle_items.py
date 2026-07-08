@@ -146,7 +146,8 @@ def _find_setinclude_section(soup: BeautifulSoup):
         el = soup.select_one(sel)
         if el:
             return el
-    for txt in ("Customize Set", "Customize set", "Included"):
+    # Important: avoid generic words like "Included" (appear on normal PDPs -> false positives).
+    for txt in ("Customize Set", "Customize set"):
         node = soup.find(string=re.compile(re.escape(txt), re.IGNORECASE))
         if node:
             cur = node.parent
@@ -172,6 +173,22 @@ def _iter_item_candidates(section: BeautifulSoup, main_url: str) -> Iterable[Tup
             continue
         if u == main_url or u in seen:
             continue
+
+        # Guardrail: only treat links as "set items" if they live inside a small block
+        # that also contains a SKU-like token. Prevents grabbing generic links on normal PDPs.
+        looks_like_item = False
+        cur = a
+        for _ in range(10):
+            if not cur:
+                break
+            txt = cur.get_text(" ", strip=True)
+            if SKU_RE.search(txt) or GENERIC_SKU_RE.search(txt):
+                looks_like_item = True
+                break
+            cur = cur.parent
+        if not looks_like_item:
+            continue
+
         seen.add(u)
         yield u, a
 
@@ -211,18 +228,44 @@ def parse_bundle_items(html: str, main_url: str) -> List[BundleItem]:
 
     items: List[BundleItem] = []
     for item_url, a in _iter_item_candidates(section, main_url):
-        container = a
-        chosen = None
-        for _ in range(6):
-            if not container:
+        # Choose the best container:
+        # On Coleman bundle pages, SKU/name/link may be in a "right-section" while the image
+        # thumbnail is in a sibling "left-section" under a higher ancestor.
+        # Prefer the smallest ancestor that contains BOTH a SKU-like token and an image/bg image.
+        cur = a
+        chosen = a.parent
+        sku_container = None
+        best_combined = None
+        best_combined_img_count: Optional[int] = None
+
+        for _ in range(10):
+            if not cur:
                 break
-            txt = container.get_text(" ", strip=True)
-            if "SKU" in txt or GENERIC_SKU_RE.search(txt):
-                chosen = container
-                break
-            container = container.parent
-        if not chosen:
-            chosen = a.parent
+
+            txt = cur.get_text(" ", strip=True)
+            has_sku = ("SKU" in txt) or bool(GENERIC_SKU_RE.search(txt))
+            if has_sku and sku_container is None:
+                sku_container = cur
+
+            try:
+                img_count = len(cur.select("img, picture source"))
+            except Exception:
+                img_count = 0
+            has_bg = "url(" in ((cur.get("style") or "").lower())
+            has_img = (img_count > 0) or has_bg
+
+            if has_sku and has_img:
+                if best_combined is None or (best_combined_img_count is not None and img_count < best_combined_img_count):
+                    best_combined = cur
+                    best_combined_img_count = img_count
+
+            chosen = cur
+            cur = cur.parent
+
+        if best_combined is not None:
+            chosen = best_combined
+        elif sku_container is not None:
+            chosen = sku_container
 
         container_html = str(chosen) if chosen else ""
         item_sku = _extract_sku_from_container(chosen, container_html)
