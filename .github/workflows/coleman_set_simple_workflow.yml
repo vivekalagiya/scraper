@@ -63,8 +63,27 @@ jobs:
       - name: Prepare URL list from provided file
         if: inputs.urls_file != ''
         run: |
+          FILE="${{ inputs.urls_file }}"
+          echo "Input urls_file: $FILE"
+          echo "Repo root contents:"
+          ls -la
+          # Auto-resolve common relative paths
+          if [ ! -f "$FILE" ] && [ -f "coleman_set_simple/$FILE" ]; then
+            FILE="coleman_set_simple/$FILE"
+          fi
+          if [ ! -f "$FILE" ] && [ -f "./$FILE" ]; then
+            FILE="./$FILE"
+          fi
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: urls_file not found at: $FILE"
+            echo "coleman_set_simple/data listing (if exists):"
+            ls -la coleman_set_simple || true
+            ls -la coleman_set_simple/data || true
+            exit 1
+          fi
+          echo "Resolved urls_file: $FILE"
           python coleman_set_simple/prepare_urls_input.py \
-            --in "${{ inputs.urls_file }}" \
+            --in "$FILE" \
             --out coleman_product_urls.csv
 
       - name: Chunk URL file + build matrix

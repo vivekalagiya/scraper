@@ -99,8 +99,10 @@ def main() -> int:
                         out_f.flush()
                         print(f"[progress] wrote {wrote} rows (processed {processed} urls)")
 
+    # It's normal for many URLs to NOT be set/bundle pages.
+    # Always exit 0 so matrix jobs don't fail just because a chunk had no bundles.
     print(f"Saved {wrote} rows to: {args.out}")
-    return 0 if wrote else 1
+    return 0
 
 
 if __name__ == "__main__":

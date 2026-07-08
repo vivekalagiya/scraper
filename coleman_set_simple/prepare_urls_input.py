@@ -128,6 +128,16 @@ def main() -> int:
     args = ap.parse_args()
 
     inp = args.inp
+    if not os.path.exists(inp):
+        print(f"ERROR: input file not found: {inp}", file=sys.stderr)
+        print(f"cwd: {os.getcwd()}", file=sys.stderr)
+        try:
+            print("repo root listing:", file=sys.stderr)
+            for name in sorted(os.listdir("."))[:200]:
+                print(" -", name, file=sys.stderr)
+        except Exception:
+            pass
+        return 2
     low = inp.lower()
     if low.endswith(".xlsx") or low.endswith(".xlsm"):
         rows = _from_xlsx(inp)
