@@ -18,7 +18,8 @@ import sys
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 
-URL_RE = re.compile(r"https?://[^\\s)\"']+", re.IGNORECASE)
+# Match until whitespace or a common trailing delimiter.
+URL_RE = re.compile(r"https?://[^\s)\"']+", re.IGNORECASE)
 
 
 def _norm_brand(sheet_name: str) -> str:
